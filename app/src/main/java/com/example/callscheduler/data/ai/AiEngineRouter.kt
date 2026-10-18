@@ -59,42 +59,62 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
                 "오디오 파일을 찾을 수 없거나 비어 있습니다: ${audioOrPcmFile.name}"
             }
 
-            // Android 13(API 33)+ 내장 SpeechRecognizer + EXTRA_AUDIO_SOURCE (PCM 디코딩 파이프) 시도
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val pcmTemp = File(context.cacheDir, "decoded_${System.currentTimeMillis()}.pcm")
+                val chunkFiles = mutableListOf<File>()
                 try {
                     val decoded = AudioPcmDecoder.decodeToPcmInfo(audioOrPcmFile, pcmTemp).getOrThrow()
-                    val recognizedText = recognizePcmWithAndroidSpeechRecognizer(
-                        pcmFile = decoded.pcmFile,
-                        sampleRate = decoded.sampleRate,
-                        channelCount = decoded.channelCount
-                    )
-                    if (!recognizedText.isNullOrBlank()) {
+                    chunkFiles.addAll(AudioPcmDecoder.splitAndTrimSilenceIntoChunks(decoded, context.cacheDir, chunkSeconds = 8))
+
+                    val segments = mutableListOf<String>()
+                    for (chunk in chunkFiles) {
+                        val part = recognizeSinglePcmChunk(
+                            pcmFile = chunk,
+                            sampleRate = decoded.sampleRate,
+                            channelCount = decoded.channelCount
+                        )
+                        if (!part.isNullOrBlank()) {
+                            segments.add(part.trim())
+                        }
+                        delay(150L)
+                    }
+
+                    val fullTranscript = segments.joinToString(" ").trim()
+                    if (fullTranscript.isNotBlank()) {
+                        // 오디오 길이(초) 대비 인식된 글자 수를 확인하여 중간에 끊겼는지 신뢰도 계산
+                        val expectedMinChars = (decoded.durationSeconds * 2.2f).toInt().coerceAtLeast(10)
+                        val completenessRatio = (fullTranscript.length.toFloat() / expectedMinChars.toFloat()).coerceIn(0.2f, 1.0f)
+                        val confidence = if (fullTranscript.length < 12 && decoded.durationSeconds >= 4f) {
+                            0.35f // 앞부분 2~3단어만 인식되고 끊긴 경우 낮은 신뢰도를 부여해 하이브리드 폴백 유도
+                        } else {
+                            (0.65f + 0.25f * completenessRatio).coerceAtMost(0.90f)
+                        }
+
                         return@runCatching SttResult(
-                            transcript = recognizedText.trim(),
-                            confidence = 0.82f,
+                            transcript = fullTranscript,
+                            confidence = confidence,
                             engineName = "ANDROID_ON_DEVICE_STT"
                         )
                     }
                 } finally {
+                    chunkFiles.forEach { runCatching { it.delete() } }
                     runCatching { pcmTemp.delete() }
                 }
             }
 
             throw IllegalStateException(
-                "단말기 내장 음성 인식기가 백그라운드 오디오 파일 변환을 지원하지 않습니다. " +
-                "2번 카드에서 Gemini API 키를 저장한 뒤 하이브리드 또는 클라우드 모드를 사용해 주세요."
+                "단말기 내장 음성 인식기가 오디오 변환을 완료하지 못했습니다. Gemini API 키를 설정하면 끊김 없는 전체 통화 인식이 가능합니다."
             )
         }
     }
 
-    private suspend fun recognizePcmWithAndroidSpeechRecognizer(
+    private suspend fun recognizeSinglePcmChunk(
         pcmFile: File,
         sampleRate: Int,
         channelCount: Int
     ): String? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
-        return withTimeoutOrNull(25_000L) {
+        return withTimeoutOrNull(18_000L) {
             withContext(Dispatchers.Main) {
                 suspendCancellableCoroutine { cont ->
                     val recognizer = runCatching {
@@ -120,7 +140,8 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
                         return@suspendCancellableCoroutine
                     }
 
-                    var lastPartial = ""
+                    val collectedPieces = mutableListOf<String>()
+                    var latestPartial = ""
 
                     recognizer.setRecognitionListener(object : RecognitionListener {
                         override fun onReadyForSpeech(params: Bundle?) {}
@@ -133,22 +154,34 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
                             val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                             val text = list?.firstOrNull()?.trim()
                             if (!text.isNullOrBlank()) {
-                                lastPartial = text
+                                // 이전 partial보다 짧아졌다는 것은 내부 세그먼트가 넘어갔음을 의미하므로 이전 partial 보존
+                                if (latestPartial.length >= 6 && text.length < latestPartial.length / 2) {
+                                    collectedPieces.add(latestPartial)
+                                }
+                                latestPartial = text
                             }
                         }
 
                         override fun onResults(results: Bundle?) {
                             val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            val finalText = list?.firstOrNull()?.trim().takeUnless { it.isNullOrBlank() } ?: lastPartial
+                            val finalText = list?.firstOrNull()?.trim().takeUnless { it.isNullOrBlank() } ?: latestPartial
+                            if (finalText.isNotBlank()) {
+                                collectedPieces.add(finalText)
+                            }
+                            val combined = collectedPieces.distinct().joinToString(" ").trim()
                             runCatching { pfd.close() }
                             runCatching { recognizer.destroy() }
-                            if (cont.isActive) cont.resume(finalText.ifBlank { null })
+                            if (cont.isActive) cont.resume(combined.ifBlank { null })
                         }
 
                         override fun onError(error: Int) {
+                            if (latestPartial.isNotBlank()) {
+                                collectedPieces.add(latestPartial)
+                            }
+                            val combined = collectedPieces.distinct().joinToString(" ").trim()
                             runCatching { pfd.close() }
                             runCatching { recognizer.destroy() }
-                            if (cont.isActive) cont.resume(lastPartial.ifBlank { null })
+                            if (cont.isActive) cont.resume(combined.ifBlank { null })
                         }
 
                         override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -158,12 +191,15 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
                         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                         putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
                         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 10000L)
+                        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 10000L)
+                        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 12000L)
                         putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pfd)
                         putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
                         putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, channelCount.coerceIn(1, 2))
                         putExtra(
                             RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE,
-                            if (sampleRate in listOf(8000, 16000, 24000, 44100, 48000)) sampleRate else 16000
+                            if (sampleRate in listOf(8000, 16000, 22050, 24000, 44100, 48000)) sampleRate else 16000
                         )
                     }
 
@@ -187,10 +223,17 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
 
 class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor {
 
-    private val locationRegex = Regex("""([가-힣0-9A-Za-z]{2,15}(?:역|카페|스타벅스|투썸|사무실|빌딩|회의실|병원|식당|레스토랑|호텔|센터|지점|본사|호점)(?:\s*[가-힣0-9A-Za-z]{1,10})?)""")
-    private val atLocationRegex = Regex("""([가-힣0-9A-Za-z\s]{2,15})에서\s*(?:만나|미팅|보기로|뵙|모임|진행|식사|회의)""")
+    private val locationRegex = Regex("""([가-힣0-9A-Za-z]{1,15}(?:유치원|어린이집|학교|학원|역|카페|스타벅스|투썸|사무실|빌딩|회의실|병원|의원|치과|식당|레스토랑|호텔|센터|지점|본사|호점|집|공원|마트|백화점|공항|터미널)(?:\s*[가-힣0-9A-Za-z]{1,10})?)""")
+    private val atLocationRegex = Regex("""([가-힣0-9A-Za-z\s]{2,15})에서\s*(?:만나|미팅|보기로|뵙|모임|진행|식사|회의|하원|등원|출발|집합|모여)""")
     private val monthDayRegex = Regex("""(\d{1,2})\s*월\s*(\d{1,2})\s*일""")
+    private val dayOnlyRegex = Regex("""(?<!\d)(\d{1,2})\s*일(?:이|에|날|\s|$)""")
     private val timeRegex = Regex("""(오전|오후|아침|점심|저녁|밤)?\s*(\d{1,2})\s*시(?:\s*(\d{1,2})\s*분|\s*(반))?""")
+
+    private val appointmentKeywords = listOf(
+        "약속", "미팅", "만나", "시죠", "봬요", "회의", "식사", "보기로",
+        "하원", "등원", "데리러", "픽업", "행사", "아빠의 날", "엄마의 날", "부모참여",
+        "예약", "방문", "수업", "병원", "치과", "검진", "모임", "출발", "까지 와", "까지 오", "까지 가"
+    )
 
     override suspend fun extractActions(
         metadata: CallMetadata,
@@ -201,17 +244,17 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
             val baseTime = metadata.callDateTime
             val parsedTime = parseKoreanDateTime(baseTime, transcript)
             val extractedLocation = extractLocation(transcript)
+            val hasAppointmentKeyword = appointmentKeywords.any { transcript.contains(it) }
 
-            if (transcript.contains("약속") || transcript.contains("미팅") || transcript.contains("만나") ||
-                transcript.contains("시죠") || transcript.contains("봬요") || transcript.contains("회의") ||
-                transcript.contains("식사") || transcript.contains("보기로")
-            ) {
+            // 일상/가족 통화 키워드가 있거나, 구체적인 날짜·시간(예: "21일", "6시까지")이 명시된 경우 일정으로 추출
+            if (hasAppointmentKeyword || parsedTime != null) {
                 val start = parsedTime ?: baseTime.plusDays(1).withHour(14).withMinute(0).withSecond(0)
+                val inferredTitle = inferAppointmentTitle(metadata.contactName, transcript, extractedLocation)
                 results.add(
                     ExtractedActionDto(
                         actionType = "APPOINTMENT",
-                        title = "${metadata.contactName}님과 미팅/약속",
-                        description = "통화 내용 기반 추출: $transcript",
+                        title = inferredTitle,
+                        description = "통화 내용 요약: $transcript",
                         startDateTimeIso = start.withNano(0).toString(),
                         endDateTimeIso = start.plusHours(1).withNano(0).toString(),
                         location = extractedLocation
@@ -237,7 +280,7 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
 
             if (transcript.contains("확인") || transcript.contains("검토") || transcript.contains("자료") ||
                 transcript.contains("견적") || transcript.contains("보내드") || transcript.contains("전달") ||
-                transcript.contains("작성")
+                transcript.contains("작성") || transcript.contains("챙겨") || transcript.contains("준비해")
             ) {
                 val todoTime = baseTime.plusHours(2).withMinute(0).withSecond(0)
                 results.add(
@@ -256,21 +299,34 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         }
     }
 
+    private fun inferAppointmentTitle(contactName: String, transcript: String, location: String?): String {
+        return when {
+            transcript.contains("유치원") && transcript.contains("하원") -> "유치원 하원"
+            transcript.contains("어린이집") && transcript.contains("하원") -> "어린이집 하원"
+            transcript.contains("아빠의 날") -> "아빠의 날 행사 (${location ?: contactName})"
+            transcript.contains("병원") || transcript.contains("치과") || transcript.contains("검진") -> "${location ?: "병원"} 방문/예약"
+            transcript.contains("식사") || transcript.contains("점심") || transcript.contains("저녁") -> "${contactName}님과 식사 약속"
+            !location.isNullOrBlank() -> "${contactName}님과 일정 ($location)"
+            else -> "${contactName}님과 약속/일정"
+        }
+    }
+
     private fun cleanPlaceName(raw: String): String {
         return raw.trim()
             .removeSuffix("에서")
             .removeSuffix("으로")
             .removeSuffix("로")
             .removeSuffix("까지")
+            .removeSuffix("하원")
             .trim()
     }
 
     private fun extractLocation(transcript: String): String? {
-        atLocationRegex.find(transcript)?.groupValues?.getOrNull(1)?.let {
+        locationRegex.find(transcript)?.groupValues?.getOrNull(1)?.let {
             val cleaned = cleanPlaceName(it)
             if (cleaned.isNotBlank()) return cleaned
         }
-        locationRegex.find(transcript)?.groupValues?.getOrNull(1)?.let {
+        atLocationRegex.find(transcript)?.groupValues?.getOrNull(1)?.let {
             val cleaned = cleanPlaceName(it)
             if (cleaned.isNotBlank()) return cleaned
         }
@@ -294,6 +350,7 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         var date = base.toLocalDate()
         var dateMatched = false
 
+        // 1. "X월 Y일" 체크
         val mdMatch = monthDayRegex.find(text)
         if (mdMatch != null) {
             val m = mdMatch.groupValues[1].toIntOrNull()
@@ -308,6 +365,26 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
             }
         }
 
+        // 2. "21일이", "21일에" 등 단독 일(day) 표현 체크
+        if (!dateMatched) {
+            val dMatch = dayOnlyRegex.find(text)
+            if (dMatch != null) {
+                val d = dMatch.groupValues[1].toIntOrNull()
+                if (d != null && d in 1..31) {
+                    runCatching {
+                        var candidate = date.withDayOfMonth(d.coerceAtMost(date.lengthOfMonth()))
+                        if (candidate.isBefore(date)) {
+                            val nextMonth = date.plusMonths(1)
+                            candidate = nextMonth.withDayOfMonth(d.coerceAtMost(nextMonth.lengthOfMonth()))
+                        }
+                        date = candidate
+                        dateMatched = true
+                    }
+                }
+            }
+        }
+
+        // 3. 상대 날짜 ("오늘", "내일", "모레", "다음 주") 체크
         if (!dateMatched) {
             when {
                 text.contains("글피") -> { date = date.plusDays(3); dateMatched = true }
@@ -344,7 +421,7 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
                 "오후", "저녁", "밤" -> if (rawHour in 1..11) rawHour + 12 else rawHour
                 "오전", "아침" -> if (rawHour == 12) 0 else rawHour
                 "점심" -> if (rawHour in 1..3) rawHour + 12 else rawHour
-                else -> if (rawHour in 1..7) rawHour + 12 else rawHour
+                else -> if (rawHour in 1..8) rawHour + 12 else rawHour // "6시까지 유치원 하원" 등 일상 시간은 오후(18시)로 자동 보정
             }
             minute = when {
                 rawMin != null -> rawMin.coerceIn(0, 59)
@@ -384,7 +461,6 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
 class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : SttEngine, ScheduleExtractor {
 
     companion object {
-        // 503(과부하)이나 404 발생 시 다음 경량/안정 모델로 즉시 자동 전환
         private val CANDIDATE_MODELS = listOf(
             "gemini-3.5-flash-lite",
             "gemini-3.6-flash",
@@ -421,7 +497,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 put(
                     JSONObject().put(
                         "text",
-                        "이 통화 녹음 오디오를 한국어로 정확하게 받아쓰기(STT)한 뒤 JSON 객체 {\"transcript\": \"전체 통화 내용\"} 형식으로만 응답하세요."
+                        "이 통화 녹음 오디오를 한국어로 빠짐없이 받아쓰기(STT)한 뒤 JSON 객체 {\"transcript\": \"전체 통화 내용\"} 형식으로만 응답하세요."
                     )
                 )
             }
@@ -432,9 +508,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             }.toString()
 
             val responseText = postGeminiJsonWithFallback(apiKey, requestJson)
-            val parsedTranscript = runCatching {
-                JSONObject(responseText).optString("transcript", responseText)
-            }.getOrDefault(responseText).trim()
+            val parsedTranscript = unwrapTranscriptJson(responseText)
 
             require(parsedTranscript.isNotBlank()) { "오디오에서 음성을 추출하지 못했습니다." }
 
@@ -444,6 +518,39 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 engineName = "CLOUD_GEMINI_AUDIO"
             )
         }
+    }
+
+    /**
+     * Gemini가 {"transcript": "..."} 객체 또는 [{"transcript": "..."}] 배열 어느 쪽으로 응답하더라도
+     * JSON 괄호 없이 순수 한국어 텍스트만 추출합니다.
+     */
+    private fun unwrapTranscriptJson(raw: String): String {
+        val cleaned = raw.trim()
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+        return runCatching {
+            when {
+                cleaned.startsWith("[") -> {
+                    val arr = JSONArray(cleaned)
+                    val sb = StringBuilder()
+                    for (i in 0 until arr.length()) {
+                        val item = arr.optJSONObject(i)
+                        val t = item?.optString("transcript") ?: arr.optString(i)
+                        if (!t.isNullOrBlank()) {
+                            if (sb.isNotEmpty()) sb.append(" ")
+                            sb.append(t.trim())
+                        }
+                    }
+                    sb.toString().ifBlank { cleaned }
+                }
+                cleaned.startsWith("{") -> {
+                    JSONObject(cleaned).optString("transcript", cleaned).trim()
+                }
+                else -> cleaned
+            }
+        }.getOrDefault(cleaned).trim()
     }
 
     override suspend fun extractActions(
@@ -476,7 +583,6 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 return callSingleModel(apiKey, modelName, requestJson)
             } catch (e: GeminiRetryableHttpException) {
                 lastError = e
-                // 404 에러 메시지에 추천 모델(models/...)이 있으면 즉시 먼저 시도
                 if (e.statusCode == 404) {
                     val suggested = SUGGESTED_MODEL_REGEX.findAll(e.errorBody)
                         .map { it.groupValues[1] }
@@ -489,14 +595,12 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                         }
                     }
                 }
-                // 503(UNAVAILABLE) 또는 429(과부하) 시 짧게 대기 후 다음 후보 모델로 즉시 폴백
                 delay(400L)
             } catch (e: Exception) {
                 lastError = e
             }
         }
 
-        // 모든 기본 후보가 실패할 경우 Models API로 사용 가능한 Flash 모델 전체 탐색 후 순차 시도
         val discoveredList = discoverAvailableFlashModels(apiKey)
         for (discovered in discoveredList) {
             if (discovered in modelsToTry) continue
@@ -613,7 +717,7 @@ fun buildExtractionPrompt(metadata: CallMetadata, transcript: String): String = 
 당신은 통화 녹음 텍스트에서 일정(APPOINTMENT), 할 일(TODO), 다시 연락하기(CALLBACK)를 추출하는 비서입니다.
 - 통화 상대방: ${metadata.contactName}
 - 통화 종료 일시(기준 시각): ${metadata.callDateTime}
-반드시 기준 시각을 바탕으로 '오늘', '내일', '모레', '다음 주' 등의 상대적 날짜를 정확한 ISO-8601(yyyy-MM-dd'T'HH:mm:ss) 시각으로 계산하세요.
+반드시 기준 시각을 바탕으로 '오늘', '내일', '모레', '다음 주', '21일' 등의 날짜를 정확한 ISO-8601(yyyy-MM-dd'T'HH:mm:ss) 시각으로 계산하세요.
 JSON 배열 스키마로만 응답하세요:
 [{"actionType":"APPOINTMENT|TODO|CALLBACK","title":"제목","description":"요약","startDateTimeIso":"2026-10-19T15:00:00","endDateTimeIso":"2026-10-19T16:00:00","location":"장소"}]
 
@@ -636,14 +740,10 @@ class HybridCallAiProcessor(
         val hasApiKey = settingsDataStore.getCurrentApiKey().isNotBlank()
 
         return runCatching {
-            val sttResult = when (mode) {
+            var sttResult = when (mode) {
                 EngineMode.ON_DEVICE -> {
                     onDeviceStt.transcribe(audioFile).recoverCatching { localErr ->
-                        if (hasApiKey) {
-                            cloudEngine.transcribe(audioFile).getOrThrow()
-                        } else {
-                            throw localErr
-                        }
+                        if (hasApiKey) cloudEngine.transcribe(audioFile).getOrThrow() else throw localErr
                     }.getOrThrow()
                 }
                 EngineMode.CLOUD_API -> cloudEngine.transcribe(audioFile).recoverCatching { cloudErr ->
@@ -653,14 +753,15 @@ class HybridCallAiProcessor(
                     val local = onDeviceStt.transcribe(audioFile).getOrNull()
                     if (local != null && local.confidence >= MIN_CONFIDENCE_THRESHOLD) {
                         local
-                    } else {
+                    } else if (hasApiKey) {
                         cloudEngine.transcribe(audioFile).getOrElse { local ?: throw it }
+                    } else {
+                        local ?: throw IllegalStateException("온디바이스 음성 인식 결과가 너무 짧고 API 키가 설정되지 않았습니다.")
                     }
                 }
             }
 
-            // 클라우드 과부하(503) 등으로 일정 추출 API가 실패하더라도 내장 한국어 NLP 추출기로 안전하게 폴백
-            val actions = when (mode) {
+            var actions = when (mode) {
                 EngineMode.ON_DEVICE -> onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
                 EngineMode.CLOUD_API, EngineMode.AUTO_FALLBACK -> {
                     if (hasApiKey) {
@@ -669,6 +770,22 @@ class HybridCallAiProcessor(
                         }.getOrThrow()
                     } else {
                         onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
+                    }
+                }
+            }
+
+            // 만약 온디바이스 STT가 앞부분 몇 글자("어 남편 음" 등)만 인식하고 끊겨서 일정이 0건으로 나왔는데
+            // API 키가 등록되어 있다면, 자동으로 클라우드 오디오 STT로 재인식하여 누락된 일정을 구제합니다.
+            if (actions.isEmpty() && sttResult.engineName == "ANDROID_ON_DEVICE_STT" && sttResult.transcript.length < 25 && hasApiKey) {
+                val rescuedStt = cloudEngine.transcribe(audioFile).getOrNull()
+                if (rescuedStt != null && rescuedStt.transcript.length > sttResult.transcript.length) {
+                    sttResult = rescuedStt
+                    actions = if (mode == EngineMode.ON_DEVICE) {
+                        onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrDefault(emptyList())
+                    } else {
+                        cloudEngine.extractActions(metadata, sttResult.transcript)
+                            .recoverCatching { onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow() }
+                            .getOrDefault(emptyList())
                     }
                 }
             }

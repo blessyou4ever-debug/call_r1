@@ -3,13 +3,16 @@ package com.example.callscheduler.data.parser
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import kotlin.math.abs
 
 data class DecodedPcmInfo(
     val pcmFile: File,
     val sampleRate: Int,
-    val channelCount: Int
+    val channelCount: Int,
+    val durationSeconds: Float
 )
 
 object AudioPcmDecoder {
@@ -77,7 +80,79 @@ object AudioPcmDecoder {
         codec.stop()
         codec.release()
         extractor.release()
-        DecodedPcmInfo(outputPcmFile, sampleRate, channelCount)
+
+        val bytesPerSecond = (sampleRate * channelCount * 2).coerceAtLeast(1)
+        val durationSeconds = outputPcmFile.length().toFloat() / bytesPerSecond.toFloat()
+        DecodedPcmInfo(outputPcmFile, sampleRate, channelCount, durationSeconds)
+    }
+
+    /**
+     * 통화 중 침묵(Pause) 때문에 Android SpeechRecognizer가 첫 마디("어 남편 음")만 인식하고
+     * 끊어버리는 현상을 막기 위해, 긴 무음 구간을 제거하고 8초 단위의 연속 청크 파일들로 분할합니다.
+     */
+    fun splitAndTrimSilenceIntoChunks(
+        decoded: DecodedPcmInfo,
+        cacheDir: File,
+        chunkSeconds: Int = 8
+    ): List<File> {
+        val rawBytes = runCatching { decoded.pcmFile.readBytes() }.getOrNull() ?: return listOf(decoded.pcmFile)
+        if (rawBytes.isEmpty()) return emptyList()
+
+        val frameBytes = (decoded.channelCount * 2).coerceAtLeast(2)
+        // 50ms 단위 프레임 크기
+        val windowFrames = (decoded.sampleRate / 20).coerceAtLeast(160)
+        val windowBytes = windowFrames * frameBytes
+
+        val activeAudioOut = ByteArrayOutputStream(rawBytes.size)
+        var consecutiveSilentWindows = 0
+
+        var offset = 0
+        while (offset + windowBytes <= rawBytes.size) {
+            var sumAbs = 0L
+            var samples = 0
+            var i = offset
+            while (i + 1 < offset + windowBytes) {
+                val lo = rawBytes[i].toInt() and 0xFF
+                val hi = rawBytes[i + 1].toInt()
+                val sample = (hi shl 8) or lo
+                sumAbs += abs(sample)
+                samples++
+                i += frameBytes
+            }
+            val avgAmp = if (samples > 0) (sumAbs / samples) else 0L
+            if (avgAmp < 180L) {
+                consecutiveSilentWindows++
+                // 200ms(4윈도우) 이하의 짧은 숨고르기만 유지하고 그 이상 긴 침묵은 잘라내어 VAD 조기 종료 방지
+                if (consecutiveSilentWindows <= 4) {
+                    activeAudioOut.write(rawBytes, offset, windowBytes)
+                }
+            } else {
+                consecutiveSilentWindows = 0
+                activeAudioOut.write(rawBytes, offset, windowBytes)
+            }
+            offset += windowBytes
+        }
+        if (offset < rawBytes.size) {
+            activeAudioOut.write(rawBytes, offset, rawBytes.size - offset)
+        }
+
+        val compactBytes = activeAudioOut.toByteArray().takeIf { it.size >= windowBytes } ?: rawBytes
+        val bytesPerChunk = (decoded.sampleRate * decoded.channelCount * 2 * chunkSeconds).coerceAtLeast(32000)
+
+        val chunkFiles = mutableListOf<File>()
+        var chunkStart = 0
+        var idx = 0
+        while (chunkStart < compactBytes.size) {
+            val end = (chunkStart + bytesPerChunk).coerceAtMost(compactBytes.size)
+            val len = end - chunkStart
+            if (len > windowBytes) {
+                val chunkFile = File(cacheDir, "stt_chunk_${System.currentTimeMillis()}_${idx++}.pcm")
+                FileOutputStream(chunkFile).use { it.write(compactBytes, chunkStart, len) }
+                chunkFiles.add(chunkFile)
+            }
+            chunkStart = end
+        }
+        return chunkFiles.ifEmpty { listOf(decoded.pcmFile) }
     }
 
     fun decodeToPcmFile(inputAudioFile: File, outputPcmFile: File): Result<File> =
