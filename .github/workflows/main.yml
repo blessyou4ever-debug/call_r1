@@ -1,4 +1,4 @@
-name: Build CallScheduler Debug APK
+name: Build CallScheduler Signed Release APK
 
 on:
   push:
@@ -18,16 +18,31 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Generate Release Keystore for V1+V2+V3 APK Signing
+        run: |
+          if [ ! -f app/release-keystore.jks ]; then
+            keytool -genkeypair -v \
+              -keystore app/release-keystore.jks \
+              -alias callscheduler \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "CallScheduler2026!" \
+              -keypass "CallScheduler2026!" \
+              -dname "CN=CallScheduler, OU=Mobile, O=CallScheduler, L=Seoul, S=Seoul, C=KR"
+          fi
+
       - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.7'
 
-      - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Build Signed Release APK
+        run: |
+          gradle assembleRelease --no-daemon --stacktrace
+          mkdir -p app/build/outputs/apk/release-ready
+          cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release-ready/CallScheduler-signed-release.apk
 
-      - name: Upload Debug APK Artifact
+      - name: Upload Signed Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CallScheduler-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: CallScheduler-signed-release-apk
+          path: app/build/outputs/apk/release-ready/CallScheduler-signed-release.apk

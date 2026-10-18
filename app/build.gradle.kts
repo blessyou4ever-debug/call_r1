@@ -11,13 +11,41 @@ android {
         applicationId = "com.example.callscheduler"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "2.1.0"
+    }
+
+    signingConfigs {
+        create("release") {
+            val ksFile = file("release-keystore.jks")
+            if (ksFile.exists()) {
+                storeFile = ksFile
+                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "CallScheduler2026!"
+                keyAlias = System.getenv("KEY_ALIAS") ?: "callscheduler"
+                keyPassword = System.getenv("KEY_PASSWORD") ?: "CallScheduler2026!"
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            isDebuggable = false
+            val ksFile = file("release-keystore.jks")
+            signingConfig = if (ksFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
+        }
+        debug {
+            val ksFile = file("release-keystore.jks")
+            if (ksFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {

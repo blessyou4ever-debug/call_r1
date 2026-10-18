@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Calendar Card Body (White) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M31,34h46c3.3,0 6,2.7 6,6v34c0,3.3 -2.7,6 -6,6H31c-3.3,0 -6,-2.7 -6,-6V40c0,-3.3 2.7,-6 6,-6z" />
+    <!-- Calendar Top Header Bar (Emerald Accent) -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M31,34h46c3.3,0 6,2.7 6,6v7H25v-7c0,-3.3 2.7,-6 6,-6z" />
+    <!-- Calendar Binding Rings -->
+    <path
+        android:fillColor="#E2E8F0"
+        android:pathData="M39,29h4v8h-4zM65,29h4v8h-4z" />
+    <!-- Calendar Schedule Lines inside Card -->
+    <path
+        android:fillColor="#E0E7FF"
+        android:pathData="M33,54h18v4H33zM33,62h12v4H33z" />
+    <!-- Phone Call & Check Badge (Indigo Circle) -->
+    <path
+        android:fillColor="#4F46E5"
+        android:pathData="M64,63m-14,0a14,14 0,1 1,28 0a14,14 0,1 1,-28 0" />
+    <!-- White Checkmark inside Badge -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M61.5,67.5l-5,-5l2.1,-2.1l2.9,2.9l7.4,-7.4l2.1,2.1z" />
+    <!-- AI Sparkle Star at Top Right -->
+    <path
+        android:fillColor="#FBBF24"
+        android:pathData="M78,24l2,4.5l4.5,2l-4.5,2l-2,4.5l-2,-4.5l-4.5,-2l4.5,-2z" />
+</vector>

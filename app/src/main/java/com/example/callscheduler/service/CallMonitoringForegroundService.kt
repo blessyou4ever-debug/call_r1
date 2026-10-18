@@ -209,10 +209,15 @@ class CallMonitoringForegroundService : Service() {
     }
 
     private fun registerMediaStoreObserver() {
-        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        val handler = Handler(Looper.getMainLooper())
+        val observer = object : ContentObserver(handler) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 super.onChange(selfChange, uri)
                 enqueueRecentMediaStoreScan(applicationContext)
+                // 녹음 파일 저장 직후 인덱싱 지연에 대비해 2.5초 뒤 한 번 더 확인
+                handler.postDelayed({
+                    enqueueRecentMediaStoreScan(applicationContext)
+                }, 2500L)
             }
         }
         runCatching {

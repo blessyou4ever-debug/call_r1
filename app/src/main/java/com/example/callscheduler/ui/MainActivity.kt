@@ -142,7 +142,6 @@ class MainActivity : ComponentActivity() {
                                             val perms = mutableListOf(
                                                 Manifest.permission.READ_CALENDAR,
                                                 Manifest.permission.WRITE_CALENDAR,
-                                                Manifest.permission.READ_PHONE_STATE,
                                                 Manifest.permission.RECORD_AUDIO
                                             )
                                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
