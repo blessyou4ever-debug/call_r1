@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -39,6 +40,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -57,9 +59,12 @@ class MainActivity : ComponentActivity() {
                 val scope = rememberCoroutineScope()
                 val currentMode by settingsDataStore.engineModeFlow.collectAsState(initial = EngineMode.AUTO_FALLBACK)
                 val apiKey by settingsDataStore.apiKeyFlow.collectAsState(initial = "")
+                val customCallDir by settingsDataStore.customCallDirFlow.collectAsState(initial = "")
                 val actionItems by dao.observeAllActionItems().collectAsState(initial = emptyList())
                 val callRecords by dao.observeAllCallRecords().collectAsState(initial = emptyList())
+
                 var apiKeyInput by remember(apiKey) { mutableStateOf(apiKey) }
+                var customDirInput by remember(customCallDir) { mutableStateOf(customCallDir) }
                 var customTestText by remember {
                     mutableStateOf("김대리님, 모레 오전 10시 반에 판교역 스타벅스에서 프로젝트 미팅 진행하시죠. 요청하신 견적서 자료도 검토해서 오늘 저녁에 다시 연락드리겠습니다.")
                 }
@@ -75,11 +80,44 @@ class MainActivity : ComponentActivity() {
                     }
                     val deniedCount = grantMap.values.count { !it }
                     val msg = if (deniedCount == 0) {
-                        "실시간 감시를 시작했습니다. (기존 녹음은 건너뛰고 지금부터 새로 생성되는 통화만 자동 분석합니다)"
+                        "실시간 감시를 시작했습니다. (기존 녹음은 제외하고 지금부터 새로 생성되는 통화만 자동 분석합니다)"
                     } else {
                         "감시 서비스를 시작했습니다. (일부 권한이 거부되어 캘린더 인텐트 연동 모드로 동작할 수 있습니다)"
                     }
                     Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                }
+
+                // 폴더 탐색기로 통화 녹음 경로 직접 선택 (SAF OpenDocumentTree -> 실제 파일 경로 변환)
+                val folderPickerLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocumentTree()
+                ) { treeUri: Uri? ->
+                    if (treeUri != null) {
+                        runCatching {
+                            contentResolver.takePersistableUriPermission(
+                                treeUri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                        }
+                        val resolvedPath = resolveTreeUriToFilePath(treeUri)
+                        if (!resolvedPath.isNullOrBlank()) {
+                            customDirInput = resolvedPath
+                            scope.launch {
+                                settingsDataStore.setCustomCallDir(resolvedPath)
+                                reloadMonitoringDirectories(this@MainActivity)
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "통화 녹음 폴더가 설정되었습니다: $resolvedPath",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        } else {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "선택한 폴더 경로를 확인해 주세요.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
                 }
 
                 val audioPickerLauncher = rememberLauncherForActivityResult(
@@ -114,9 +152,9 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v2)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v2.2)", style = MaterialTheme.typography.titleLarge)
                                 Text(
-                                    "MediaStore 실시간 감지 + 통화 종료 자동 스캔 + 직접 파일 선택 지원",
+                                    "삼성 기본전화 · SKT T전화/에이닷 파일명 완벽 호환 + 사용자 폴더 경로 설정",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -176,7 +214,7 @@ class MainActivity : ComponentActivity() {
                                     )
                                     OutlinedButton(
                                         onClick = {
-                                            val samplePath = "/storage/emulated/0/Recordings/Call/통화 김대리_261018_121018.m4u"
+                                            val samplePath = "/storage/emulated/0/Recordings/TPhoneCallRecords/김대리_01012345678_20261019143022.m4u"
                                             val input = Data.Builder()
                                                 .putString("KEY_FILE_PATH", samplePath)
                                                 .putString("KEY_SIMULATED_TRANSCRIPT", customTestText)
@@ -187,11 +225,102 @@ class MainActivity : ComponentActivity() {
                                                     .setInputData(input)
                                                     .build()
                                             )
-                                            Toast.makeText(this@MainActivity, "통화 내용 분석 및 알림을 실행했습니다.", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(this@MainActivity, "T전화 형식(이름만 추출) 테스트 분석을 실행했습니다.", Toast.LENGTH_SHORT).show()
                                         },
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
                                         Text("위 대화 내용으로 일정 추출 및 푸시 알림 실행")
+                                    }
+                                }
+                            }
+                        }
+
+                        // 2. 통화 녹음 폴더 경로 설정 카드 (T전화 / 삼성 기본전화 / 폴더 탐색기)
+                        item {
+                            Card(modifier = Modifier.fillMaxWidth()) {
+                                Column(
+                                    modifier = Modifier.padding(16.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text("2. 통화 녹음 폴더 경로 설정 (기기·전화 앱별 맞춤)", style = MaterialTheme.typography.titleMedium)
+                                    val statusDesc = if (customCallDir.isBlank()) {
+                                        "현재: 통합 자동 감시 (삼성 Recordings/Call + T전화 TPhoneCallRecords 모두 감시)"
+                                    } else {
+                                        val exists = File(customCallDir).exists()
+                                        "현재 지정 경로: $customCallDir (${if (exists) "폴더 확인됨" else "폴더 생성 시 자동 감시"})"
+                                    }
+                                    Text(statusDesc, style = MaterialTheme.typography.bodySmall)
+
+                                    FilledTonalButton(
+                                        onClick = { folderPickerLauncher.launch(null) },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("스마트폰 폴더 탐색기로 통화 녹음 폴더 직접 선택")
+                                    }
+
+                                    Text("또는 사용하는 전화 앱 기본 경로 빠른 선택:", style = MaterialTheme.typography.labelMedium)
+                                    AiSettingsDataStore.DEFAULT_CALL_DIR_PRESETS.forEach { preset ->
+                                        OutlinedButton(
+                                            onClick = {
+                                                customDirInput = preset.path
+                                                scope.launch {
+                                                    settingsDataStore.setCustomCallDir(preset.path)
+                                                    reloadMonitoringDirectories(this@MainActivity)
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "[${preset.label}] 경로로 설정되었습니다.",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("${preset.label}: ${preset.path}", style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+
+                                    OutlinedTextField(
+                                        value = customDirInput,
+                                        onValueChange = { customDirInput = it },
+                                        label = { Text("직접 폴더 경로 입력 (비워두면 모든 경로 통합 감시)") },
+                                        placeholder = { Text("/storage/emulated/0/Recordings/TPhoneCallRecords") },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        singleLine = true
+                                    )
+
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(
+                                            onClick = {
+                                                scope.launch {
+                                                    settingsDataStore.setCustomCallDir(customDirInput)
+                                                    reloadMonitoringDirectories(this@MainActivity)
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "통화 녹음 폴더 경로가 저장 및 적용되었습니다.",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                }
+                                            },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("경로 저장 및 감시 적용")
+                                        }
+                                        OutlinedButton(
+                                            onClick = {
+                                                customDirInput = ""
+                                                scope.launch {
+                                                    settingsDataStore.setCustomCallDir("")
+                                                    reloadMonitoringDirectories(this@MainActivity)
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "모든 통화 녹음 경로 통합 감시 모드로 초기화했습니다.",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                }
+                                            }
+                                        ) {
+                                            Text("통합 감시 초기화")
+                                        }
                                     }
                                 }
                             }
@@ -203,7 +332,7 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier.padding(16.dp),
                                     verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    Text("2. AI 음성 인식(STT) 및 일정 추출 모드", style = MaterialTheme.typography.titleMedium)
+                                    Text("3. AI 음성 인식(STT) 및 일정 추출 모드", style = MaterialTheme.typography.titleMedium)
                                     EngineMode.values().forEach { mode ->
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             RadioButton(
@@ -243,7 +372,7 @@ class MainActivity : ComponentActivity() {
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text("3. 감지된 약속·할 일·콜백 (${actionItems.size}건)", style = MaterialTheme.typography.titleMedium)
+                                Text("4. 감지된 약속·할 일·콜백 (${actionItems.size}건)", style = MaterialTheme.typography.titleMedium)
                                 if (actionItems.isNotEmpty() || callRecords.isNotEmpty()) {
                                     TextButton(
                                         onClick = {
@@ -296,7 +425,7 @@ class MainActivity : ComponentActivity() {
 
                         if (callRecords.isNotEmpty()) {
                             item {
-                                Text("4. 최근 통화 분석 로그 및 STT 원문 (${callRecords.size}건)", style = MaterialTheme.typography.titleMedium)
+                                Text("5. 최근 통화 분석 로그 및 STT 원문 (${callRecords.size}건)", style = MaterialTheme.typography.titleMedium)
                             }
                             items(callRecords) { rec ->
                                 CallRecordLogCard(rec)
@@ -307,6 +436,38 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun reloadMonitoringDirectories(context: Context) {
+        CallMonitoringForegroundService.initializeOrResetBaseline(context, forceResetToNow = true)
+        val serviceIntent = Intent(context, CallMonitoringForegroundService::class.java).apply {
+            action = CallMonitoringForegroundService.ACTION_RELOAD_DIRS
+        }
+        runCatching {
+            ContextCompat.startForegroundService(context, serviceIntent)
+        }
+    }
+
+    /**
+     * SAF OpenDocumentTree URI (예: content://com.android.externalstorage.documents/tree/primary%3ARecordings%2FTPhoneCallRecords)
+     * 를 실제 파일시스템 경로(/storage/emulated/0/Recordings/TPhoneCallRecords)로 변환합니다.
+     */
+    private fun resolveTreeUriToFilePath(treeUri: Uri): String? = runCatching {
+        val docId = DocumentsContract.getTreeDocumentId(treeUri) ?: return@runCatching null
+        val decoded = URLDecoder.decode(docId, "UTF-8")
+        when {
+            decoded.startsWith("primary:") -> {
+                val subPath = decoded.removePrefix("primary:").trim('/')
+                if (subPath.isEmpty()) "/storage/emulated/0" else "/storage/emulated/0/$subPath"
+            }
+            decoded.contains(":") -> {
+                val parts = decoded.split(":", limit = 2)
+                val volumeId = parts[0]
+                val subPath = parts.getOrElse(1) { "" }.trim('/')
+                if (subPath.isEmpty()) "/storage/$volumeId" else "/storage/$volumeId/$subPath"
+            }
+            else -> "/storage/emulated/0/${decoded.trim('/')}"
+        }
+    }.getOrNull()
 
     private suspend fun copyUriToCacheFile(context: Context, uri: Uri): File? = withContext(Dispatchers.IO) {
         runCatching {

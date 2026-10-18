@@ -109,13 +109,13 @@ class CallProcessWorker(
             val entity = ActionItemEntity(
                 callRecordId = callRecordId,
                 contactName = metadata.contactName,
-                phoneNumber = metadata.phoneNumber,
+                phoneNumber = "",
                 actionType = dto.actionType,
-                title = dto.title,
-                description = dto.description,
+                title = CallFilenameParser.stripPhoneNumbers(dto.title).ifBlank { "${metadata.contactName}님과 일정" },
+                description = CallFilenameParser.stripPhoneNumbers(dto.description),
                 startEpochMillis = startMillis,
                 endEpochMillis = endMillis,
-                location = dto.location,
+                location = dto.location?.let { CallFilenameParser.stripPhoneNumbers(it) }?.ifBlank { null },
                 status = "PENDING"
             )
             val insertedId = dao.insertActionItem(entity)

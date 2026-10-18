@@ -14,81 +14,118 @@ data class CallMetadata(
 )
 
 object CallFilenameParser {
-    // 1순위: 사용자 지정 형식 -> "통화 이름_날짜_통화종료시간.m4u" (예: "통화 김대리_261018_121018.m4u", "통화 홍길동_20261018_1210.m4u")
-    private val USER_CALL_FORMAT_REGEX = Regex(
-        pattern = """^(?:통화(?:\s*녹음)?[_\s-]+)?(.+?)[_\s-]+(\d{6}|\d{8}|\d{4}-\d{2}-\d{2})[_\s-]+(\d{4}|\d{6})\.([a-zA-Z0-9]+)$"""
+
+    // 파일명 끝에 오는 날짜+시간 패턴:
+    // 1) 분리형: _20261019_143022, _261019_143022, _2026-10-19_14-30-22, _261019_1430
+    private val TRAILING_SPLIT_DATETIME_REGEX = Regex(
+        pattern = """[_\s-]+(\d{6}|\d{8}|\d{4}-\d{2}-\d{2})[_\s-]+(\d{4}|\d{6}|\d{2}-\d{2}-\d{2})$"""
     )
 
-    // 2순위: 이름 + 전화번호 + 날짜 + 통화종료시간 형식 -> "통화 녹음_김대리_010-1234-5678_261018_121018.m4u"
-    private val NAME_AND_PHONE_REGEX = Regex(
-        pattern = """^(?:통화(?:\s*녹음)?)[_\s-]+(.+?)[_\s-]+(01[016789][-_]?\d{3,4}[-_]?\d{4})(?:[_\s-]+(\d{6}|\d{8}|\d{4}-\d{2}-\d{2})[_\s-]?(\d{4}|\d{6}))?\.([a-zA-Z0-9]+)$"""
+    // 2) T전화 등 통합형: _20261019143022 (14자리), _261019143022 (12자리), _202610191430 (12자리), _2610191430 (10자리)
+    private val TRAILING_COMBINED_DATETIME_REGEX = Regex(
+        pattern = """[_\s-]+(\d{14}|\d{12}|\d{10})$"""
     )
 
-    private val PHONE_ONLY_REGEX = Regex("""^01[016789][-_]?\d{3,4}[-_]?\d{4}$""")
+    // 전화번호 토큰 또는 문자열 내 전화번호 패턴 (일정 제목/메모/이름에서 완전 제거용)
+    private val PHONE_TOKEN_REGEX = Regex(
+        pattern = """^(?:\+?82[-_\s]?)?0?\d{1,2}[-_\s]?\d{3,4}[-_\s]?\d{4}$|^\d{7,13}$"""
+    )
+    private val INLINE_PHONE_CLEAN_REGEX = Regex(
+        pattern = """(?:\+?82[-_\s]?)?0\d{1,2}[-_\s]?\d{3,4}[-_\s]?\d{4}|(?<!\d)\d{8,13}(?!\d)"""
+    )
 
     fun parse(file: File): CallMetadata {
-        val fileName = file.name
+        val baseName = file.nameWithoutExtension.trim()
+        var working = baseName
+        var parsedDateTime: LocalDateTime? = null
 
-        // 1. 이름 + 전화번호가 모두 들어있는 경우 먼저 체크
-        val phoneMatch = NAME_AND_PHONE_REGEX.find(fileName)
-        if (phoneMatch != null) {
-            val (rawName, rawPhone, datePart, timePart) = phoneMatch.destructured
-            val parsedDateTime = parseDateTime(datePart, timePart, file.lastModified())
-            return CallMetadata(
-                filePath = file.absolutePath,
-                contactName = rawName.trim(),
-                phoneNumber = rawPhone.replace("_", "-"),
-                callDateTime = parsedDateTime
-            )
+        // 1단계: 끝에 붙은 날짜·시간 추출 및 제거
+        val splitMatch = TRAILING_SPLIT_DATETIME_REGEX.find(working)
+        if (splitMatch != null) {
+            val datePart = splitMatch.groupValues[1].replace("-", "")
+            val timePart = splitMatch.groupValues[2].replace("-", "")
+            parsedDateTime = parseDateTimeParts(datePart, timePart, file.lastModified())
+            working = working.substring(0, splitMatch.range.first).trim()
+        } else {
+            val combinedMatch = TRAILING_COMBINED_DATETIME_REGEX.find(working)
+            if (combinedMatch != null) {
+                val dtRaw = combinedMatch.groupValues[1]
+                parsedDateTime = parseCombinedDateTime(dtRaw, file.lastModified())
+                working = working.substring(0, combinedMatch.range.first).trim()
+            }
         }
 
-        // 2. "통화 이름_날짜_통화종료시간.m4u" (또는 .m4a 등) 형식 체크
-        val userMatch = USER_CALL_FORMAT_REGEX.find(fileName)
-        if (userMatch != null) {
-            val (rawNamePart, datePart, endTimePart) = userMatch.destructured
-            val cleanedName = rawNamePart
-                .removePrefix("통화 녹음")
-                .removePrefix("통화녹음")
-                .removePrefix("통화")
-                .trim('_', '-', ' ')
-                .ifEmpty { "알 수 없는 상대" }
-
-            val isPhoneAsName = PHONE_ONLY_REGEX.matches(cleanedName)
-            val parsedDateTime = parseDateTime(datePart, endTimePart, file.lastModified())
-
-            return CallMetadata(
-                filePath = file.absolutePath,
-                contactName = cleanedName,
-                phoneNumber = if (isPhoneAsName) cleanedName.replace("_", "-") else "",
-                callDateTime = parsedDateTime
-            )
-        }
-
-        // 3. 기타 파일명 폴백 처리
-        val fallbackName = file.nameWithoutExtension
-            .removePrefix("통화 녹음")
-            .removePrefix("통화녹음")
-            .removePrefix("통화")
+        // 2단계: 앞쪽 불필요 접두어("통화 녹음", "통화녹음", "통화", "T전화", "에이닷", "녹음") 제거
+        working = working
+            .replace(Regex("""^(?:T전화|에이닷|통화\s*녹음|통화녹음|통화|녹음)[_\s-]+""", RegexOption.IGNORE_CASE), "")
             .trim('_', '-', ' ')
-            .ifEmpty { "알 수 없는 상대" }
 
+        // 3단계: 언더바(_) 또는 하이픈(-)으로 구분된 토큰 중 전화번호(010..., 02..., 숫자열)를 모두 제거하고 순수 이름만 추출
+        val tokens = working.split(Regex("""[_]+""")).map { it.trim() }.filter { it.isNotBlank() }
+        val nameTokens = tokens.filterNot { token ->
+            PHONE_TOKEN_REGEX.matches(token)
+        }.map { token ->
+            // 혹시 "홍길동-01012345678" 처럼 하이픈으로 붙어있는 경우 전화번호 부분만 제거
+            INLINE_PHONE_CLEAN_REGEX.replace(token, "").trim('_', '-', ' ', '(', ')')
+        }.filter { it.isNotBlank() }
+
+        val cleanName = nameTokens.joinToString(" ")
+            .replace(Regex("""^(?:통화\s*녹음|통화녹음|통화|녹음)\s*"""), "")
+            .trim('_', '-', ' ', '(', ')')
+            .ifEmpty { "통화 상대" }
+
+        val finalDateTime = parsedDateTime ?: LocalDateTime.ofInstant(
+            Instant.ofEpochMilli(file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()),
+            ZoneId.systemDefault()
+        )
+
+        // 전화번호 등 불필요한 개인/메타 정보가 일정에 등록되지 않도록 phoneNumber는 항상 빈 문자열로 유지
         return CallMetadata(
             filePath = file.absolutePath,
-            contactName = fallbackName,
-            phoneNumber = if (PHONE_ONLY_REGEX.matches(fallbackName)) fallbackName else "",
-            callDateTime = LocalDateTime.ofInstant(
-                Instant.ofEpochMilli(file.lastModified().takeIf { it > 0L } ?: System.currentTimeMillis()),
-                ZoneId.systemDefault()
-            )
+            contactName = cleanName,
+            phoneNumber = "",
+            callDateTime = finalDateTime
         )
     }
 
-    private fun parseDateTime(datePart: String, timePart: String, fallbackMillis: Long): LocalDateTime {
+    /**
+     * 일정 제목이나 설명에 전화번호가 섞여 들어가는 것을 방지하기 위한 정제 함수
+     */
+    fun stripPhoneNumbers(text: String): String {
+        return INLINE_PHONE_CLEAN_REGEX.replace(text, "")
+            .replace("()", "")
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+    }
+
+    private fun parseCombinedDateTime(dtRaw: String, fallbackMillis: Long): LocalDateTime {
+        return try {
+            when (dtRaw.length) {
+                14 -> LocalDateTime.parse(dtRaw, DateTimeFormatter.ofPattern("yyyyMMddHHmmss"))
+                12 -> {
+                    if (dtRaw.startsWith("20")) {
+                        LocalDateTime.parse(dtRaw + "00", DateTimeFormatter.ofPattern("yyyyMMddHHmmss"))
+                    } else {
+                        LocalDateTime.parse(dtRaw, DateTimeFormatter.ofPattern("yyMMddHHmmss"))
+                    }
+                }
+                10 -> LocalDateTime.parse(dtRaw + "00", DateTimeFormatter.ofPattern("yyMMddHHmmss"))
+                else -> throw IllegalArgumentException("Unsupported combined datetime: $dtRaw")
+            }
+        } catch (e: Exception) {
+            LocalDateTime.ofInstant(
+                Instant.ofEpochMilli(fallbackMillis.takeIf { it > 0L } ?: System.currentTimeMillis()),
+                ZoneId.systemDefault()
+            )
+        }
+    }
+
+    private fun parseDateTimeParts(datePart: String, timePart: String, fallbackMillis: Long): LocalDateTime {
         return try {
             val normalizedDate = datePart.replace("-", "")
             val normalizedTime = when (timePart.length) {
-                4 -> timePart + "00" // HHmm -> HHmm00
-                6 -> timePart        // HHmmss
+                4 -> timePart + "00"
+                6 -> timePart
                 else -> "120000"
             }
             when (normalizedDate.length) {

@@ -715,9 +715,11 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
 
 fun buildExtractionPrompt(metadata: CallMetadata, transcript: String): String = """
 당신은 통화 녹음 텍스트에서 일정(APPOINTMENT), 할 일(TODO), 다시 연락하기(CALLBACK)를 추출하는 비서입니다.
-- 통화 상대방: ${metadata.contactName}
+- 통화 상대방 이름: ${metadata.contactName}
 - 통화 종료 일시(기준 시각): ${metadata.callDateTime}
-반드시 기준 시각을 바탕으로 '오늘', '내일', '모레', '다음 주', '21일' 등의 날짜를 정확한 ISO-8601(yyyy-MM-dd'T'HH:mm:ss) 시각으로 계산하세요.
+중요 규칙:
+1. 제목(title), 요약(description), 장소(location) 어디에도 전화번호(010-xxxx-xxxx 등 숫자 번호)나 파일명 정보를 절대 포함하지 마세요. 오직 통화 상대방 이름(${metadata.contactName})만 사용하세요.
+2. 반드시 기준 시각을 바탕으로 '오늘', '내일', '모레', '다음 주', '21일' 등의 날짜를 정확한 ISO-8601(yyyy-MM-dd'T'HH:mm:ss) 시각으로 계산하세요.
 JSON 배열 스키마로만 응답하세요:
 [{"actionType":"APPOINTMENT|TODO|CALLBACK","title":"제목","description":"요약","startDateTimeIso":"2026-10-19T15:00:00","endDateTimeIso":"2026-10-19T16:00:00","location":"장소"}]
 
