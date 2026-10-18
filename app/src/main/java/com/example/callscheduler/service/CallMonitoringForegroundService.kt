@@ -32,21 +32,90 @@ class CallMonitoringForegroundService : Service() {
         )
         private const val MONITOR_CHANNEL_ID = "call_monitor_service_channel"
         private const val NOTIFICATION_ID = 9001
-        const val ACTION_SCAN_RECENT = "com.example.callscheduler.ACTION_SCAN_RECENT"
+        private const val PREFS_NAME = "call_monitor_watermark_prefs"
+        private const val KEY_WATERMARK_MILLIS = "watermark_epoch_millis"
+        private const val KEY_SEEN_PATHS = "seen_file_paths"
+        const val ACTION_RESET_BASELINE = "com.example.callscheduler.ACTION_RESET_BASELINE"
 
+        /**
+         * 감시 시작 시점 기준 시각(Watermark)을 현재 시각으로 설정하고,
+         * 기존에 폴더/MediaStore에 이미 있던 녹음 파일들을 스냅샷 처리하여 절대 긁어오지 않도록 차단합니다.
+         */
+        fun initializeOrResetBaseline(context: Context, forceResetToNow: Boolean = false) {
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val now = System.currentTimeMillis()
+            val existingWatermark = prefs.getLong(KEY_WATERMARK_MILLIS, 0L)
+
+            if (forceResetToNow || existingWatermark == 0L) {
+                val seen = (prefs.getStringSet(KEY_SEEN_PATHS, emptySet()) ?: emptySet()).toMutableSet()
+                // 현재 폴더에 이미 존재하는 모든 녹음 파일을 seen 목록에 등록하여 기존 파일 분석 원천 차단
+                for (dirPath in CANDIDATE_CALL_DIRS) {
+                    val dir = File(dirPath)
+                    if (dir.exists() && dir.isDirectory) {
+                        dir.listFiles()?.forEach { f ->
+                            if (f.isFile) seen.add(f.absolutePath)
+                        }
+                    }
+                }
+                prefs.edit()
+                    .putLong(KEY_WATERMARK_MILLIS, now)
+                    .putStringSet(KEY_SEEN_PATHS, seen)
+                    .apply()
+            }
+        }
+
+        private fun isStrictlyNewAndUnseenFile(context: Context, file: File): Boolean {
+            if (!file.exists() || file.length() <= 0L) return false
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val watermark = prefs.getLong(KEY_WATERMARK_MILLIS, System.currentTimeMillis())
+            val seen = prefs.getStringSet(KEY_SEEN_PATHS, emptySet()) ?: emptySet()
+
+            if (file.absolutePath in seen) return false
+            // 감시 시작 시각(watermark) 이전에 생성/수정된 기존 파일은 무조건 제외
+            if (file.lastModified() < watermark) return false
+            return true
+        }
+
+        private fun markFileAsSeenAndAdvanceWatermark(context: Context, file: File) {
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val currentWatermark = prefs.getLong(KEY_WATERMARK_MILLIS, System.currentTimeMillis())
+            val seen = (prefs.getStringSet(KEY_SEEN_PATHS, emptySet()) ?: emptySet()).toMutableSet()
+            seen.add(file.absolutePath)
+            val nextWatermark = maxOf(currentWatermark, file.lastModified())
+            prefs.edit()
+                .putLong(KEY_WATERMARK_MILLIS, nextWatermark)
+                .putStringSet(KEY_SEEN_PATHS, seen)
+                .apply()
+        }
+
+        /**
+         * MediaStore 변화 또는 통화 종료 시 호출되며, 오직 감시 시작 시각(Watermark) 이후에
+         * 새로 추가된 통화 녹음 파일만 찾아 큐에 넣습니다. (기존 파일 스캔 원천 차단)
+         */
         fun enqueueRecentMediaStoreScan(context: Context) {
+            val appCtx = context.applicationContext
+            initializeOrResetBaseline(appCtx, forceResetToNow = false)
+            val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val watermarkMillis = prefs.getLong(KEY_WATERMARK_MILLIS, System.currentTimeMillis())
+            val watermarkSeconds = (watermarkMillis / 1000L) - 2L
+
             val projection = arrayOf(
                 MediaStore.Audio.Media.DATA,
                 MediaStore.Audio.Media.DISPLAY_NAME,
-                MediaStore.Audio.Media.DATE_ADDED
+                MediaStore.Audio.Media.DATE_ADDED,
+                MediaStore.Audio.Media.DATE_MODIFIED
             )
+            // DATE_ADDED가 감시 시작 시점 이후인 신규 오디오만 조회
+            val selection = "${MediaStore.Audio.Media.DATE_ADDED} >= ? OR ${MediaStore.Audio.Media.DATE_MODIFIED} >= ?"
+            val selectionArgs = arrayOf(watermarkSeconds.toString(), watermarkSeconds.toString())
             val sortOrder = "${MediaStore.Audio.Media.DATE_ADDED} DESC"
+
             runCatching {
-                context.contentResolver.query(
+                appCtx.contentResolver.query(
                     MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
                     projection,
-                    null,
-                    null,
+                    selection,
+                    selectionArgs,
                     sortOrder
                 )?.use { cursor ->
                     val dataIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
@@ -58,8 +127,9 @@ class CallMonitoringForegroundService : Service() {
                         val name = if (nameIdx >= 0) cursor.getString(nameIdx) else ""
                         if (!path.isNullOrBlank() && isLikelyCallRecording(path, name ?: "")) {
                             val file = File(path)
-                            if (file.exists() && file.length() > 0L) {
-                                enqueueFileAnalysis(context, file.absolutePath)
+                            if (isStrictlyNewAndUnseenFile(appCtx, file)) {
+                                markFileAsSeenAndAdvanceWatermark(appCtx, file)
+                                enqueueFileAnalysis(appCtx, file.absolutePath)
                                 break
                             }
                         }
@@ -98,14 +168,15 @@ class CallMonitoringForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        initializeOrResetBaseline(applicationContext, forceResetToNow = false)
         startForegroundWithNotification()
         startWatchingCallDirectories()
         registerMediaStoreObserver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_SCAN_RECENT) {
-            enqueueRecentMediaStoreScan(applicationContext)
+        if (intent?.action == ACTION_RESET_BASELINE) {
+            initializeOrResetBaseline(applicationContext, forceResetToNow = true)
         }
         return START_STICKY
     }
@@ -121,8 +192,8 @@ class CallMonitoringForegroundService : Service() {
 
         val notification = NotificationCompat.Builder(this, MONITOR_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_call)
-            .setContentTitle("통화 녹음 자동 일정 감지 중")
-            .setContentText("MediaStore 및 통화 녹음 폴더를 실시간 감시하고 있습니다.")
+            .setContentTitle("새 통화 녹음 실시간 감지 중")
+            .setContentText("기존 파일은 제외하고 지금부터 새로 생성되는 통화 녹음만 분석합니다.")
             .setOngoing(true)
             .build()
 
@@ -169,7 +240,10 @@ class CallMonitoringForegroundService : Service() {
                         if ((eventType == FileObserver.CLOSE_WRITE || eventType == FileObserver.MOVED_TO) && path != null) {
                             val file = File(dir, path)
                             if (file.extension.lowercase() in listOf("m4u", "m4a", "amr", "mp3", "wav", "ogg", "3gp", "aac")) {
-                                enqueueFileAnalysis(applicationContext, file.absolutePath)
+                                if (isStrictlyNewAndUnseenFile(applicationContext, file)) {
+                                    markFileAsSeenAndAdvanceWatermark(applicationContext, file)
+                                    enqueueFileAnalysis(applicationContext, file.absolutePath)
+                                }
                             }
                         }
                     }

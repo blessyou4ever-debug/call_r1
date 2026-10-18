@@ -1,12 +1,24 @@
 package com.example.callscheduler.data.ai
 
 import android.content.Context
+import android.content.Intent
+import android.media.AudioFormat
+import android.os.Build
+import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Base64
 import com.example.callscheduler.data.local.datastore.AiSettingsDataStore
 import com.example.callscheduler.data.local.datastore.EngineMode
+import com.example.callscheduler.data.parser.AudioPcmDecoder
 import com.example.callscheduler.data.parser.CallMetadata
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -15,6 +27,7 @@ import java.net.URL
 import java.time.DayOfWeek
 import java.time.LocalDateTime
 import java.time.temporal.TemporalAdjusters
+import kotlin.coroutines.resume
 
 data class SttResult(
     val transcript: String,
@@ -45,18 +58,129 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
             require(audioOrPcmFile.exists() && audioOrPcmFile.length() > 0L) {
                 "오디오 파일을 찾을 수 없거나 비어 있습니다: ${audioOrPcmFile.name}"
             }
-            val modelFile = File(context.filesDir, "ggml-small-q5_1.bin")
-            if (!modelFile.exists()) {
-                throw IllegalStateException(
-                    "온디바이스 Whisper 모델(ggml-small-q5_1.bin)이 설치되어 있지 않습니다. " +
-                    "Gemini API 키를 설정하여 클라우드/하이브리드 모드를 사용하거나 테스트 분석을 실행해 주세요."
-                )
+
+            // Android 13(API 33)+ 내장 SpeechRecognizer + EXTRA_AUDIO_SOURCE (PCM 디코딩 파이프) 시도
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val pcmTemp = File(context.cacheDir, "decoded_${System.currentTimeMillis()}.pcm")
+                try {
+                    val decoded = AudioPcmDecoder.decodeToPcmInfo(audioOrPcmFile, pcmTemp).getOrThrow()
+                    val recognizedText = recognizePcmWithAndroidSpeechRecognizer(
+                        pcmFile = decoded.pcmFile,
+                        sampleRate = decoded.sampleRate,
+                        channelCount = decoded.channelCount
+                    )
+                    if (!recognizedText.isNullOrBlank()) {
+                        return@runCatching SttResult(
+                            transcript = recognizedText.trim(),
+                            confidence = 0.82f,
+                            engineName = "ANDROID_ON_DEVICE_STT"
+                        )
+                    }
+                } finally {
+                    runCatching { pcmTemp.delete() }
+                }
             }
-            SttResult(
-                transcript = "온디바이스 Whisper STT 변환 텍스트 (${audioOrPcmFile.name})",
-                confidence = 0.85f,
-                engineName = "ON_DEVICE_WHISPER"
+
+            throw IllegalStateException(
+                "단말기 내장 음성 인식기가 백그라운드 오디오 파일 변환을 지원하지 않습니다. " +
+                "2번 카드에서 Gemini API 키를 저장한 뒤 하이브리드 또는 클라우드 모드를 사용해 주세요."
             )
+        }
+    }
+
+    private suspend fun recognizePcmWithAndroidSpeechRecognizer(
+        pcmFile: File,
+        sampleRate: Int,
+        channelCount: Int
+    ): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
+        return withTimeoutOrNull(25_000L) {
+            withContext(Dispatchers.Main) {
+                suspendCancellableCoroutine { cont ->
+                    val recognizer = runCatching {
+                        if (SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
+                            SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
+                        } else {
+                            SpeechRecognizer.createSpeechRecognizer(context)
+                        }
+                    }.getOrNull()
+
+                    if (recognizer == null) {
+                        if (cont.isActive) cont.resume(null)
+                        return@suspendCancellableCoroutine
+                    }
+
+                    val pfd = runCatching {
+                        ParcelFileDescriptor.open(pcmFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                    }.getOrNull()
+
+                    if (pfd == null) {
+                        runCatching { recognizer.destroy() }
+                        if (cont.isActive) cont.resume(null)
+                        return@suspendCancellableCoroutine
+                    }
+
+                    var lastPartial = ""
+
+                    recognizer.setRecognitionListener(object : RecognitionListener {
+                        override fun onReadyForSpeech(params: Bundle?) {}
+                        override fun onBeginningOfSpeech() {}
+                        override fun onRmsChanged(rmsdB: Float) {}
+                        override fun onBufferReceived(buffer: ByteArray?) {}
+                        override fun onEndOfSpeech() {}
+
+                        override fun onPartialResults(partialResults: Bundle?) {
+                            val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            val text = list?.firstOrNull()?.trim()
+                            if (!text.isNullOrBlank()) {
+                                lastPartial = text
+                            }
+                        }
+
+                        override fun onResults(results: Bundle?) {
+                            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            val finalText = list?.firstOrNull()?.trim().takeUnless { it.isNullOrBlank() } ?: lastPartial
+                            runCatching { pfd.close() }
+                            runCatching { recognizer.destroy() }
+                            if (cont.isActive) cont.resume(finalText.ifBlank { null })
+                        }
+
+                        override fun onError(error: Int) {
+                            runCatching { pfd.close() }
+                            runCatching { recognizer.destroy() }
+                            if (cont.isActive) cont.resume(lastPartial.ifBlank { null })
+                        }
+
+                        override fun onEvent(eventType: Int, params: Bundle?) {}
+                    })
+
+                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
+                        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pfd)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, channelCount.coerceIn(1, 2))
+                        putExtra(
+                            RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE,
+                            if (sampleRate in listOf(8000, 16000, 24000, 44100, 48000)) sampleRate else 16000
+                        )
+                    }
+
+                    cont.invokeOnCancellation {
+                        runCatching { pfd.close() }
+                        runCatching { recognizer.destroy() }
+                    }
+
+                    runCatching {
+                        recognizer.startListening(intent)
+                    }.onFailure {
+                        runCatching { pfd.close() }
+                        runCatching { recognizer.destroy() }
+                        if (cont.isActive) cont.resume(null)
+                    }
+                }
+            }
         }
     }
 }
@@ -260,12 +384,13 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
 class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : SttEngine, ScheduleExtractor {
 
     companion object {
-        // 신규 API 키에서 gemini-2.5-flash가 404를 반환하며 gemini-3.8-flash 사용을 안내하므로 최신 모델을 1순위로 시도하고 자동 폴백
+        // 503(과부하)이나 404 발생 시 다음 경량/안정 모델로 즉시 자동 전환
         private val CANDIDATE_MODELS = listOf(
-            "gemini-3.8-flash",
-            "gemini-3.6-flash",
-            "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash",
+            "gemini-3.1-flash-lite-preview",
             "gemini-3-flash-preview",
             "gemini-2.5-flash"
         )
@@ -342,42 +467,51 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         }
     }
 
-    private fun postGeminiJsonWithFallback(apiKey: String, requestJson: String): String {
+    private suspend fun postGeminiJsonWithFallback(apiKey: String, requestJson: String): String {
         val modelsToTry = LinkedHashSet<String>(CANDIDATE_MODELS)
         var lastError: Exception? = null
 
         for (modelName in modelsToTry.toList()) {
             try {
                 return callSingleModel(apiKey, modelName, requestJson)
-            } catch (e: GeminiModelNotFoundException) {
+            } catch (e: GeminiRetryableHttpException) {
                 lastError = e
-                // 에러 메시지 안에 "Please update your code to use models/gemini-..." 추천 모델명이 있으면 즉시 해당 모델로 시도
-                val suggested = SUGGESTED_MODEL_REGEX.findAll(e.errorBody)
-                    .map { it.groupValues[1] }
-                    .firstOrNull { it != modelName }
-                if (suggested != null && !modelsToTry.contains(suggested)) {
-                    try {
-                        return callSingleModel(apiKey, suggested, requestJson)
-                    } catch (inner: Exception) {
-                        lastError = inner
+                // 404 에러 메시지에 추천 모델(models/...)이 있으면 즉시 먼저 시도
+                if (e.statusCode == 404) {
+                    val suggested = SUGGESTED_MODEL_REGEX.findAll(e.errorBody)
+                        .map { it.groupValues[1] }
+                        .firstOrNull { it != modelName }
+                    if (suggested != null && !modelsToTry.contains(suggested)) {
+                        try {
+                            return callSingleModel(apiKey, suggested, requestJson)
+                        } catch (inner: Exception) {
+                            lastError = inner
+                        }
                     }
                 }
+                // 503(UNAVAILABLE) 또는 429(과부하) 시 짧게 대기 후 다음 후보 모델로 즉시 폴백
+                delay(400L)
             } catch (e: Exception) {
-                throw e
+                lastError = e
             }
         }
 
-        // 모든 기본 후보가 404일 경우 Models API로 사용 가능한 Flash 모델 자동 탐색
-        val discovered = discoverAvailableFlashModel(apiKey)
-        if (discovered != null) {
-            return callSingleModel(apiKey, discovered, requestJson)
+        // 모든 기본 후보가 실패할 경우 Models API로 사용 가능한 Flash 모델 전체 탐색 후 순차 시도
+        val discoveredList = discoverAvailableFlashModels(apiKey)
+        for (discovered in discoveredList) {
+            if (discovered in modelsToTry) continue
+            try {
+                return callSingleModel(apiKey, discovered, requestJson)
+            } catch (e: Exception) {
+                lastError = e
+            }
         }
 
         throw lastError ?: IllegalStateException("사용 가능한 Gemini 모델을 찾을 수 없습니다.")
     }
 
-    private class GeminiModelNotFoundException(val errorBody: String) :
-        IllegalStateException("Gemini API HTTP 404: ${errorBody.take(240)}")
+    private class GeminiRetryableHttpException(val statusCode: Int, modelName: String, val errorBody: String) :
+        IllegalStateException("Gemini API HTTP $statusCode ($modelName): ${errorBody.take(240)}")
 
     private fun callSingleModel(apiKey: String, modelName: String, requestJson: String): String {
         val cleanModel = modelName.removePrefix("models/")
@@ -395,9 +529,9 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         }
 
         val responseCode = conn.responseCode
-        if (responseCode == 404) {
+        if (responseCode in listOf(404, 429, 500, 502, 503, 504)) {
             val errBody = runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
-            throw GeminiModelNotFoundException(errBody)
+            throw GeminiRetryableHttpException(responseCode, cleanModel, errBody)
         }
         if (responseCode !in 200..299) {
             val errBody = runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
@@ -414,26 +548,27 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             .getString("text")
     }
 
-    private fun discoverAvailableFlashModel(apiKey: String): String? = runCatching {
+    private fun discoverAvailableFlashModels(apiKey: String): List<String> = runCatching {
         val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 15_000
             readTimeout = 15_000
         }
-        if (conn.responseCode !in 200..299) return@runCatching null
+        if (conn.responseCode !in 200..299) return@runCatching emptyList()
         val body = conn.inputStream.bufferedReader().use { it.readText() }
-        val models = JSONObject(body).optJSONArray("models") ?: return@runCatching null
+        val models = JSONObject(body).optJSONArray("models") ?: return@runCatching emptyList()
+        val found = mutableListOf<String>()
         for (i in 0 until models.length()) {
             val m = models.getJSONObject(i)
             val name = m.optString("name", "").removePrefix("models/")
             val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
             if (name.contains("gemini") && name.contains("flash") && methods.contains("generateContent") && !name.contains("2.5")) {
-                return@runCatching name
+                found.add(name)
             }
         }
-        null
-    }.getOrNull()
+        found
+    }.getOrDefault(emptyList())
 
     private fun parseExtractedActionsJson(rawJson: String): List<ExtractedActionDto> {
         val cleaned = rawJson.trim()
@@ -498,28 +633,37 @@ class HybridCallAiProcessor(
 
     suspend fun process(audioFile: File, metadata: CallMetadata): Result<Triple<String, String, List<ExtractedActionDto>>> {
         val mode = settingsDataStore.getCurrentMode()
+        val hasApiKey = settingsDataStore.getCurrentApiKey().isNotBlank()
 
         return runCatching {
             val sttResult = when (mode) {
-                EngineMode.ON_DEVICE -> onDeviceStt.transcribe(audioFile).getOrThrow()
-                EngineMode.CLOUD_API -> cloudEngine.transcribe(audioFile).getOrThrow()
+                EngineMode.ON_DEVICE -> {
+                    onDeviceStt.transcribe(audioFile).recoverCatching { localErr ->
+                        if (hasApiKey) {
+                            cloudEngine.transcribe(audioFile).getOrThrow()
+                        } else {
+                            throw localErr
+                        }
+                    }.getOrThrow()
+                }
+                EngineMode.CLOUD_API -> cloudEngine.transcribe(audioFile).recoverCatching { cloudErr ->
+                    onDeviceStt.transcribe(audioFile).getOrElse { throw cloudErr }
+                }.getOrThrow()
                 EngineMode.AUTO_FALLBACK -> {
                     val local = onDeviceStt.transcribe(audioFile).getOrNull()
                     if (local != null && local.confidence >= MIN_CONFIDENCE_THRESHOLD) {
                         local
                     } else {
-                        cloudEngine.transcribe(audioFile).getOrThrow()
+                        cloudEngine.transcribe(audioFile).getOrElse { local ?: throw it }
                     }
                 }
             }
 
+            // 클라우드 과부하(503) 등으로 일정 추출 API가 실패하더라도 내장 한국어 NLP 추출기로 안전하게 폴백
             val actions = when (mode) {
                 EngineMode.ON_DEVICE -> onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
-                EngineMode.CLOUD_API -> cloudEngine.extractActions(metadata, sttResult.transcript).recoverCatching {
-                    onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
-                }.getOrThrow()
-                EngineMode.AUTO_FALLBACK -> {
-                    if (settingsDataStore.getCurrentApiKey().isNotBlank()) {
+                EngineMode.CLOUD_API, EngineMode.AUTO_FALLBACK -> {
+                    if (hasApiKey) {
                         cloudEngine.extractActions(metadata, sttResult.transcript).recoverCatching {
                             onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
                         }.getOrThrow()

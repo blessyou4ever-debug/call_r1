@@ -6,8 +6,14 @@ import android.media.MediaFormat
 import java.io.File
 import java.io.FileOutputStream
 
+data class DecodedPcmInfo(
+    val pcmFile: File,
+    val sampleRate: Int,
+    val channelCount: Int
+)
+
 object AudioPcmDecoder {
-    fun decodeToPcmFile(inputAudioFile: File, outputPcmFile: File): Result<File> = runCatching {
+    fun decodeToPcmInfo(inputAudioFile: File, outputPcmFile: File): Result<DecodedPcmInfo> = runCatching {
         val extractor = MediaExtractor()
         extractor.setDataSource(inputAudioFile.absolutePath)
 
@@ -26,6 +32,8 @@ object AudioPcmDecoder {
         require(audioTrackIndex >= 0 && format != null) { "No audio track found" }
         extractor.selectTrack(audioTrackIndex)
 
+        val sampleRate = runCatching { format.getInteger(MediaFormat.KEY_SAMPLE_RATE) }.getOrDefault(16000)
+        val channelCount = runCatching { format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) }.getOrDefault(1)
         val mime = format.getString(MediaFormat.KEY_MIME)!!
         val codec = MediaCodec.createDecoderByType(mime)
         codec.configure(format, null, null, 0)
@@ -69,6 +77,9 @@ object AudioPcmDecoder {
         codec.stop()
         codec.release()
         extractor.release()
-        outputPcmFile
+        DecodedPcmInfo(outputPcmFile, sampleRate, channelCount)
     }
+
+    fun decodeToPcmFile(inputAudioFile: File, outputPcmFile: File): Result<File> =
+        decodeToPcmInfo(inputAudioFile, outputPcmFile).map { it.pcmFile }
 }

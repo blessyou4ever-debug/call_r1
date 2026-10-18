@@ -68,14 +68,14 @@ class MainActivity : ComponentActivity() {
                     ActivityResultContracts.RequestMultiplePermissions()
                 ) { grantMap ->
                     val serviceIntent = Intent(this, CallMonitoringForegroundService::class.java).apply {
-                        action = CallMonitoringForegroundService.ACTION_SCAN_RECENT
+                        action = CallMonitoringForegroundService.ACTION_RESET_BASELINE
                     }
                     runCatching {
                         ContextCompat.startForegroundService(this, serviceIntent)
                     }
                     val deniedCount = grantMap.values.count { !it }
                     val msg = if (deniedCount == 0) {
-                        "모든 권한이 승인되어 실시간 통화 녹음 감시 및 최근 녹음 스캔을 시작했습니다."
+                        "실시간 감시를 시작했습니다. (기존 녹음은 건너뛰고 지금부터 새로 생성되는 통화만 자동 분석합니다)"
                     } else {
                         "감시 서비스를 시작했습니다. (일부 권한이 거부되어 캘린더 인텐트 연동 모드로 동작할 수 있습니다)"
                     }
@@ -142,7 +142,8 @@ class MainActivity : ComponentActivity() {
                                             val perms = mutableListOf(
                                                 Manifest.permission.READ_CALENDAR,
                                                 Manifest.permission.WRITE_CALENDAR,
-                                                Manifest.permission.READ_PHONE_STATE
+                                                Manifest.permission.READ_PHONE_STATE,
+                                                Manifest.permission.RECORD_AUDIO
                                             )
                                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                                 perms.add(Manifest.permission.READ_MEDIA_AUDIO)
@@ -154,7 +155,7 @@ class MainActivity : ComponentActivity() {
                                         },
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        Text("권한 허용 및 자동 감시·최근 녹음 스캔 시작")
+                                        Text("권한 허용 및 새 통화 실시간 감시 시작 (기존 파일 제외)")
                                     }
 
                                     FilledTonalButton(
@@ -238,7 +239,26 @@ class MainActivity : ComponentActivity() {
                         }
 
                         item {
-                            Text("3. 감지된 약속·할 일·콜백 목록 (${actionItems.size}건)", style = MaterialTheme.typography.titleMedium)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("3. 감지된 약속·할 일·콜백 (${actionItems.size}건)", style = MaterialTheme.typography.titleMedium)
+                                if (actionItems.isNotEmpty() || callRecords.isNotEmpty()) {
+                                    TextButton(
+                                        onClick = {
+                                            scope.launch {
+                                                CallMonitoringForegroundService.initializeOrResetBaseline(this@MainActivity, forceResetToNow = true)
+                                                dao.clearAllHistory()
+                                                Toast.makeText(this@MainActivity, "기존 목록과 로그를 모두 비웠습니다.", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    ) {
+                                        Text("목록·로그 전체 비우기")
+                                    }
+                                }
+                            }
                         }
 
                         items(actionItems) { item ->

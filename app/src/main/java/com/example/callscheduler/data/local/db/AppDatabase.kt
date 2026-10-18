@@ -45,9 +45,16 @@ class CallSchedulerDao(private val dbHelper: AppDatabase) {
     fun observeAllActionItems(): Flow<List<ActionItemEntity>> = itemsFlow
     fun observeAllCallRecords(): Flow<List<CallRecordEntity>> = recordsFlow
 
+    suspend fun clearAllHistory() = withContext(Dispatchers.IO) {
+        val db = dbHelper.writableDatabase
+        db.delete("action_items", null, null)
+        db.delete("call_records", null, null)
+        refreshFlowSync()
+    }
+
     suspend fun hasProcessedFile(filePath: String): Boolean = withContext(Dispatchers.IO) {
         val db = dbHelper.readableDatabase
-        db.rawQuery("SELECT id FROM call_records WHERE filePath = ? AND engineUsed != 'ERROR' LIMIT 1", arrayOf(filePath)).use {
+        db.rawQuery("SELECT id FROM call_records WHERE filePath = ? LIMIT 1", arrayOf(filePath)).use {
             it.moveToFirst()
         }
     }
