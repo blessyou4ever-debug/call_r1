@@ -64,7 +64,7 @@ class GoogleCalendarSyncManager(private val context: Context) {
             put(CalendarContract.Events.TITLE, item.title)
             put(
                 CalendarContract.Events.DESCRIPTION,
-                "${item.description}\n(통화 상대: ${item.contactName} ${item.phoneNumber})"
+                "${item.description}\n(통화 상대: ${item.contactName})"
             )
             put(CalendarContract.Events.CALENDAR_ID, calendarId)
             put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().id)
@@ -100,7 +100,7 @@ class GoogleCalendarSyncManager(private val context: Context) {
             putExtra(CalendarContract.Events.TITLE, item.title)
             putExtra(
                 CalendarContract.Events.DESCRIPTION,
-                "${item.description}\n(통화 상대: ${item.contactName} ${item.phoneNumber})"
+                "${item.description}\n(통화 상대: ${item.contactName})"
             )
             if (!item.location.isNullOrBlank()) {
                 putExtra(CalendarContract.Events.EVENT_LOCATION, item.location)

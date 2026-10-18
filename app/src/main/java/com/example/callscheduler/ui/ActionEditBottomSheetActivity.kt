@@ -65,7 +65,7 @@ class ActionEditBottomSheetActivity : ComponentActivity() {
                     Surface(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text("일정 및 할 일 확인·수정", style = MaterialTheme.typography.titleLarge)
-                            Text("통화 상대: ${current.contactName} (${current.phoneNumber})")
+                            Text("통화 상대: ${current.contactName}")
                             OutlinedTextField(
                                 value = title,
                                 onValueChange = { title = it },
@@ -90,7 +90,7 @@ class ActionEditBottomSheetActivity : ComponentActivity() {
                             OutlinedTextField(
                                 value = location,
                                 onValueChange = { location = it },
-                                label = { Text("장소 또는 연락처") },
+                                label = { Text("장소") },
                                 modifier = Modifier.fillMaxWidth(),
                                 singleLine = true
                             )

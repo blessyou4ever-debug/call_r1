@@ -322,7 +322,7 @@ fun ActionItemCard(
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("[${item.actionType}] ${item.title}", style = MaterialTheme.typography.titleMedium)
-            Text("통화 상대: ${item.contactName} (${item.phoneNumber})", style = MaterialTheme.typography.bodySmall)
+            Text("통화 상대: ${item.contactName}", style = MaterialTheme.typography.bodySmall)
             Text("예정 시각: $timeText | 장소: ${item.location ?: "없음"}", style = MaterialTheme.typography.bodySmall)
             Text(item.description, style = MaterialTheme.typography.bodyMedium)
             Text("상태: ${item.status}", style = MaterialTheme.typography.labelMedium)
@@ -350,7 +350,7 @@ fun CallRecordLogCard(record: CallRecordEntity) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
-                "${record.contactName} (${record.phoneNumber.ifBlank { "번호 미상" }}) · 엔진: ${record.engineUsed}",
+                "${record.contactName} · 엔진: ${record.engineUsed}",
                 style = MaterialTheme.typography.labelLarge
             )
             Text(

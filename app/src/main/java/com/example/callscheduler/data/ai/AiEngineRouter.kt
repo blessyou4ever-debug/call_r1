@@ -103,10 +103,10 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
                     ExtractedActionDto(
                         actionType = "CALLBACK",
                         title = "${metadata.contactName}님에게 다시 연락(콜백)",
-                        description = "통화 중 다시 연락하기로 한 일정입니다. (${metadata.phoneNumber})\n원문: $transcript",
+                        description = "통화 중 다시 연락하기로 한 일정입니다.\n원문: $transcript",
                         startDateTimeIso = callbackTime.withNano(0).toString(),
                         endDateTimeIso = callbackTime.plusMinutes(30).withNano(0).toString(),
-                        location = metadata.phoneNumber.ifBlank { null }
+                        location = null
                     )
                 )
             }
@@ -132,9 +132,24 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         }
     }
 
+    private fun cleanPlaceName(raw: String): String {
+        return raw.trim()
+            .removeSuffix("에서")
+            .removeSuffix("으로")
+            .removeSuffix("로")
+            .removeSuffix("까지")
+            .trim()
+    }
+
     private fun extractLocation(transcript: String): String? {
-        locationRegex.find(transcript)?.groupValues?.getOrNull(1)?.let { return it.trim() }
-        atLocationRegex.find(transcript)?.groupValues?.getOrNull(1)?.let { return it.trim() }
+        atLocationRegex.find(transcript)?.groupValues?.getOrNull(1)?.let {
+            val cleaned = cleanPlaceName(it)
+            if (cleaned.isNotBlank()) return cleaned
+        }
+        locationRegex.find(transcript)?.groupValues?.getOrNull(1)?.let {
+            val cleaned = cleanPlaceName(it)
+            if (cleaned.isNotBlank()) return cleaned
+        }
         return null
     }
 
@@ -244,6 +259,19 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
 
 class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : SttEngine, ScheduleExtractor {
 
+    companion object {
+        // 신규 API 키에서 gemini-2.5-flash가 404를 반환하며 gemini-3.8-flash 사용을 안내하므로 최신 모델을 1순위로 시도하고 자동 폴백
+        private val CANDIDATE_MODELS = listOf(
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-2.5-flash"
+        )
+        private val SUGGESTED_MODEL_REGEX = Regex("""models/([a-zA-Z0-9._-]+)""")
+    }
+
     override suspend fun transcribe(audioOrPcmFile: File): Result<SttResult> = withContext(Dispatchers.IO) {
         runCatching {
             val apiKey = settingsDataStore.getCurrentApiKey()
@@ -278,7 +306,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
             }.toString()
 
-            val responseText = postGeminiJson(apiKey, requestJson)
+            val responseText = postGeminiJsonWithFallback(apiKey, requestJson)
             val parsedTranscript = runCatching {
                 JSONObject(responseText).optString("transcript", responseText)
             }.getOrDefault(responseText).trim()
@@ -309,13 +337,51 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
             }.toString()
 
-            val textContent = postGeminiJson(apiKey, requestJson)
+            val textContent = postGeminiJsonWithFallback(apiKey, requestJson)
             parseExtractedActionsJson(textContent)
         }
     }
 
-    private fun postGeminiJson(apiKey: String, requestJson: String): String {
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
+    private fun postGeminiJsonWithFallback(apiKey: String, requestJson: String): String {
+        val modelsToTry = LinkedHashSet<String>(CANDIDATE_MODELS)
+        var lastError: Exception? = null
+
+        for (modelName in modelsToTry.toList()) {
+            try {
+                return callSingleModel(apiKey, modelName, requestJson)
+            } catch (e: GeminiModelNotFoundException) {
+                lastError = e
+                // 에러 메시지 안에 "Please update your code to use models/gemini-..." 추천 모델명이 있으면 즉시 해당 모델로 시도
+                val suggested = SUGGESTED_MODEL_REGEX.findAll(e.errorBody)
+                    .map { it.groupValues[1] }
+                    .firstOrNull { it != modelName }
+                if (suggested != null && !modelsToTry.contains(suggested)) {
+                    try {
+                        return callSingleModel(apiKey, suggested, requestJson)
+                    } catch (inner: Exception) {
+                        lastError = inner
+                    }
+                }
+            } catch (e: Exception) {
+                throw e
+            }
+        }
+
+        // 모든 기본 후보가 404일 경우 Models API로 사용 가능한 Flash 모델 자동 탐색
+        val discovered = discoverAvailableFlashModel(apiKey)
+        if (discovered != null) {
+            return callSingleModel(apiKey, discovered, requestJson)
+        }
+
+        throw lastError ?: IllegalStateException("사용 가능한 Gemini 모델을 찾을 수 없습니다.")
+    }
+
+    private class GeminiModelNotFoundException(val errorBody: String) :
+        IllegalStateException("Gemini API HTTP 404: ${errorBody.take(240)}")
+
+    private fun callSingleModel(apiKey: String, modelName: String, requestJson: String): String {
+        val cleanModel = modelName.removePrefix("models/")
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=$apiKey")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 25_000
@@ -329,9 +395,13 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         }
 
         val responseCode = conn.responseCode
+        if (responseCode == 404) {
+            val errBody = runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
+            throw GeminiModelNotFoundException(errBody)
+        }
         if (responseCode !in 200..299) {
             val errBody = runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
-            throw IllegalStateException("Gemini API HTTP $responseCode: ${errBody.take(200)}")
+            throw IllegalStateException("Gemini API HTTP $responseCode ($cleanModel): ${errBody.take(240)}")
         }
         val responseStr = conn.inputStream.bufferedReader().use { it.readText() }
 
@@ -343,6 +413,27 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             .getJSONObject(0)
             .getString("text")
     }
+
+    private fun discoverAvailableFlashModel(apiKey: String): String? = runCatching {
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 15_000
+        }
+        if (conn.responseCode !in 200..299) return@runCatching null
+        val body = conn.inputStream.bufferedReader().use { it.readText() }
+        val models = JSONObject(body).optJSONArray("models") ?: return@runCatching null
+        for (i in 0 until models.length()) {
+            val m = models.getJSONObject(i)
+            val name = m.optString("name", "").removePrefix("models/")
+            val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
+            if (name.contains("gemini") && name.contains("flash") && methods.contains("generateContent") && !name.contains("2.5")) {
+                return@runCatching name
+            }
+        }
+        null
+    }.getOrNull()
 
     private fun parseExtractedActionsJson(rawJson: String): List<ExtractedActionDto> {
         val cleaned = rawJson.trim()
@@ -385,9 +476,9 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
 
 fun buildExtractionPrompt(metadata: CallMetadata, transcript: String): String = """
 당신은 통화 녹음 텍스트에서 일정(APPOINTMENT), 할 일(TODO), 다시 연락하기(CALLBACK)를 추출하는 비서입니다.
-- 통화 상대방: ${metadata.contactName} (${metadata.phoneNumber})
-- 통화 발생 일시(기준 시각): ${metadata.callDateTime}
-반드시 기준 시각을 바탕으로 '내일', '모레', '다음 주' 등의 상대적 날짜를 정확한 ISO-8601(yyyy-MM-dd'T'HH:mm:ss) 시각으로 계산하세요.
+- 통화 상대방: ${metadata.contactName}
+- 통화 종료 일시(기준 시각): ${metadata.callDateTime}
+반드시 기준 시각을 바탕으로 '오늘', '내일', '모레', '다음 주' 등의 상대적 날짜를 정확한 ISO-8601(yyyy-MM-dd'T'HH:mm:ss) 시각으로 계산하세요.
 JSON 배열 스키마로만 응답하세요:
 [{"actionType":"APPOINTMENT|TODO|CALLBACK","title":"제목","description":"요약","startDateTimeIso":"2026-10-19T15:00:00","endDateTimeIso":"2026-10-19T16:00:00","location":"장소"}]
 
