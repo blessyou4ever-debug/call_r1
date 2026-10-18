@@ -18,9 +18,11 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Generate Release Keystore for V1+V2+V3 APK Signing
+      - name: Restore Permanent Release Keystore (Fixed Signature for In-Place Updates)
         run: |
-          if [ ! -f app/release-keystore.jks ]; then
+          if [ -f app/release-keystore.b64 ]; then
+            base64 -d app/release-keystore.b64 > app/release-keystore.jks
+          else
             keytool -genkeypair -v \
               -keystore app/release-keystore.jks \
               -alias callscheduler \
@@ -36,6 +38,8 @@ jobs:
           gradle-version: '8.7'
 
       - name: Build Signed Release APK
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
           gradle assembleRelease --no-daemon --stacktrace
           mkdir -p app/build/outputs/apk/release-ready

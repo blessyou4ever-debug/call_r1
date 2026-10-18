@@ -1,6 +1,8 @@
 package com.example.callscheduler.ui
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -152,7 +154,7 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v2.2)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v2.3)", style = MaterialTheme.typography.titleLarge)
                                 Text(
                                     "삼성 기본전화 · SKT T전화/에이닷 파일명 완벽 호환 + 사용자 폴더 경로 설정",
                                     style = MaterialTheme.typography.bodySmall
@@ -355,11 +357,56 @@ class MainActivity : ComponentActivity() {
                                             onClick = {
                                                 scope.launch {
                                                     settingsDataStore.setGeminiApiKey(apiKeyInput)
-                                                    Toast.makeText(this@MainActivity, "API 키가 저장되었습니다.", Toast.LENGTH_SHORT).show()
+                                                    Toast.makeText(this@MainActivity, "API 키가 저장 및 자동 백업되었습니다.", Toast.LENGTH_SHORT).show()
                                                 }
                                             }
                                         ) {
                                             Text("API 키 저장")
+                                        }
+                                    }
+
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                    Text("환경설정(API 키 · 폴더 경로 · 모드) 원클릭 백업 및 복원", style = MaterialTheme.typography.labelLarge)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                val json = settingsDataStore.exportSettingsJson()
+                                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                                cm.setPrimaryClip(ClipData.newPlainText("CallSchedulerSettings", json))
+                                                Toast.makeText(
+                                                    this@MainActivity,
+                                                    "현재 환경설정(API 키·경로·모드)이 클립보드에 복사되었습니다.",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("설정 클립보드 백업")
+                                        }
+                                        Button(
+                                            onClick = {
+                                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                                val clipText = cm.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
+                                                scope.launch {
+                                                    if (settingsDataStore.importSettingsJson(clipText)) {
+                                                        reloadMonitoringDirectories(this@MainActivity)
+                                                        Toast.makeText(
+                                                            this@MainActivity,
+                                                            "클립보드에서 환경설정을 모두 복원했습니다!",
+                                                            Toast.LENGTH_LONG
+                                                        ).show()
+                                                    } else {
+                                                        Toast.makeText(
+                                                            this@MainActivity,
+                                                            "클립보드에 백업된 환경설정 데이터가 없습니다.",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                    }
+                                                }
+                                            },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("클립보드 설정 복원")
                                         }
                                     }
                                 }

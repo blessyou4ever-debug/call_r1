@@ -11,8 +11,9 @@ android {
         applicationId = "com.example.callscheduler"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "2.2.0"
+        val runNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = 100 + runNumber
+        versionName = "2.3.$runNumber"
     }
 
     signingConfigs {
