@@ -223,7 +223,8 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
 
 class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor {
 
-    private val locationRegex = Regex("""([가-힣0-9A-Za-z]{1,15}(?:유치원|어린이집|학교|학원|역|카페|스타벅스|투썸|사무실|빌딩|회의실|병원|의원|치과|식당|레스토랑|호텔|센터|지점|본사|호점|집|공원|마트|백화점|공항|터미널)(?:\s*[가-힣0-9A-Za-z]{1,10})?)""")
+    // 단독 장소명("유치원", "어린이집", "병원", "치과" 등)과 복합 장소명("판교역 스타벅스", "해피유치원") 모두 추출
+    private val locationRegex = Regex("""([가-힣0-9A-Za-z]{0,15}(?:유치원|어린이집|초등학교|중학교|고등학교|학교|학원|역|카페|스타벅스|투썸|사무실|빌딩|회의실|병원|의원|치과|식당|레스토랑|호텔|센터|지점|본사|호점|공원|마트|백화점|공항|터미널)(?:\s*[가-힣0-9A-Za-z]{1,10})?)""")
     private val atLocationRegex = Regex("""([가-힣0-9A-Za-z\s]{2,15})에서\s*(?:만나|미팅|보기로|뵙|모임|진행|식사|회의|하원|등원|출발|집합|모여)""")
     private val monthDayRegex = Regex("""(\d{1,2})\s*월\s*(\d{1,2})\s*일""")
     private val dayOnlyRegex = Regex("""(?<!\d)(\d{1,2})\s*일(?:이|에|날|\s|$)""")
@@ -246,15 +247,21 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
             val extractedLocation = extractLocation(transcript)
             val hasAppointmentKeyword = appointmentKeywords.any { transcript.contains(it) }
 
-            // 일상/가족 통화 키워드가 있거나, 구체적인 날짜·시간(예: "21일", "6시까지")이 명시된 경우 일정으로 추출
             if (hasAppointmentKeyword || parsedTime != null) {
                 val start = parsedTime ?: baseTime.plusDays(1).withHour(14).withMinute(0).withSecond(0)
                 val inferredTitle = inferAppointmentTitle(metadata.contactName, transcript, extractedLocation)
+                val conciseSummary = summarizeAppointment(
+                    contactName = metadata.contactName,
+                    start = start,
+                    location = extractedLocation,
+                    title = inferredTitle,
+                    transcript = transcript
+                )
                 results.add(
                     ExtractedActionDto(
                         actionType = "APPOINTMENT",
                         title = inferredTitle,
-                        description = "통화 내용 요약: $transcript",
+                        description = conciseSummary,
                         startDateTimeIso = start.withNano(0).toString(),
                         endDateTimeIso = start.plusHours(1).withNano(0).toString(),
                         location = extractedLocation
@@ -266,11 +273,16 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
                 transcript.contains("연락드리") || transcript.contains("전화할게")
             ) {
                 val callbackTime = parseCallbackDateTime(baseTime, transcript)
+                val callbackSummary = summarizeCallback(
+                    contactName = metadata.contactName,
+                    callbackTime = callbackTime,
+                    transcript = transcript
+                )
                 results.add(
                     ExtractedActionDto(
                         actionType = "CALLBACK",
-                        title = "${metadata.contactName}님에게 다시 연락(콜백)",
-                        description = "통화 중 다시 연락하기로 한 일정입니다.\n원문: $transcript",
+                        title = "${metadata.contactName}님 다시 연락(콜백)",
+                        description = callbackSummary,
                         startDateTimeIso = callbackTime.withNano(0).toString(),
                         endDateTimeIso = callbackTime.plusMinutes(30).withNano(0).toString(),
                         location = null
@@ -283,11 +295,15 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
                 transcript.contains("작성") || transcript.contains("챙겨") || transcript.contains("준비해")
             ) {
                 val todoTime = baseTime.plusHours(2).withMinute(0).withSecond(0)
+                val todoSummary = summarizeTodo(
+                    contactName = metadata.contactName,
+                    transcript = transcript
+                )
                 results.add(
                     ExtractedActionDto(
                         actionType = "TODO",
-                        title = "[할 일] ${metadata.contactName}님 요청 사항 처리",
-                        description = "통화 원문: $transcript",
+                        title = "[할 일] ${metadata.contactName}님 요청 사항",
+                        description = todoSummary,
                         startDateTimeIso = todoTime.withNano(0).toString(),
                         endDateTimeIso = todoTime.plusMinutes(30).withNano(0).toString(),
                         location = null
@@ -300,15 +316,134 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
     }
 
     private fun inferAppointmentTitle(contactName: String, transcript: String, location: String?): String {
+        val hasFathersDay = transcript.contains("아빠의 날")
+        val hasMothersDay = transcript.contains("엄마의 날")
+        val hasKindergarten = transcript.contains("유치원") || transcript.contains("어린이집")
+        val hasPickup = transcript.contains("하원") || transcript.contains("데리러") || transcript.contains("픽업")
+        val hasDropoff = transcript.contains("등원") || transcript.contains("등공")
+
         return when {
-            transcript.contains("유치원") && transcript.contains("하원") -> "유치원 하원"
-            transcript.contains("어린이집") && transcript.contains("하원") -> "어린이집 하원"
-            transcript.contains("아빠의 날") -> "아빠의 날 행사 (${location ?: contactName})"
-            transcript.contains("병원") || transcript.contains("치과") || transcript.contains("검진") -> "${location ?: "병원"} 방문/예약"
+            hasFathersDay && hasKindergarten && hasPickup -> "아빠의 날 유치원 하원"
+            hasFathersDay && hasKindergarten && hasDropoff -> "아빠의 날 유치원 등원"
+            hasFathersDay -> "아빠의 날 행사${if (!location.isNullOrBlank()) " ($location)" else ""}"
+            hasMothersDay -> "엄마의 날 행사${if (!location.isNullOrBlank()) " ($location)" else ""}"
+            transcript.contains("유치원") && hasPickup -> "유치원 하원"
+            transcript.contains("어린이집") && hasPickup -> "어린이집 하원"
+            transcript.contains("유치원") && hasDropoff -> "유치원 등원"
+            transcript.contains("병원") || transcript.contains("치과") || transcript.contains("검진") -> "${location ?: "병원"} 방문 예약"
+            transcript.contains("미팅") || transcript.contains("회의") -> "${contactName}님과 미팅${if (!location.isNullOrBlank()) " ($location)" else ""}"
             transcript.contains("식사") || transcript.contains("점심") || transcript.contains("저녁") -> "${contactName}님과 식사 약속"
             !location.isNullOrBlank() -> "${contactName}님과 일정 ($location)"
-            else -> "${contactName}님과 약속/일정"
+            else -> "${contactName}님과 약속 일정"
         }
+    }
+
+    /**
+     * 통화 원문(구어체 필러·호칭·인사말 포함)을 그대로 넣지 않고,
+     * 핵심 일시·장소·용건만 추려 1줄의 깔끔한 요약문으로 변환합니다.
+     */
+    private fun summarizeAppointment(
+        contactName: String,
+        start: LocalDateTime,
+        location: String?,
+        title: String,
+        transcript: String
+    ): String {
+        val dateTimeLabel = formatKoreanFriendlyDateTime(start)
+        val coreTopic = extractCleanedCoreTopic(transcript, title, location)
+        val locPart = if (!location.isNullOrBlank() && !coreTopic.contains(location)) " $location에서" else ""
+        return "${contactName}님과 통화 중 $dateTimeLabel$locPart $coreTopic 일정 확인"
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+    }
+
+    private fun summarizeCallback(
+        contactName: String,
+        callbackTime: LocalDateTime,
+        transcript: String
+    ): String {
+        val dateTimeLabel = formatKoreanFriendlyDateTime(callbackTime)
+        val coreTopic = extractCleanedCoreTopic(transcript, "논의 사항", null)
+        return "${contactName}님과 통화 중 $dateTimeLabel $coreTopic 관련 다시 연락하기로 확인"
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+    }
+
+    private fun summarizeTodo(
+        contactName: String,
+        transcript: String
+    ): String {
+        val coreTopic = extractCleanedCoreTopic(transcript, "요청 사항", null)
+        return "${contactName}님과 통화 중 $coreTopic 처리 및 확인 필요"
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+    }
+
+    private fun formatKoreanFriendlyDateTime(dt: LocalDateTime): String {
+        val meridiem = if (dt.hour < 12) "오전" else "오후"
+        val displayHour = when {
+            dt.hour == 0 -> 12
+            dt.hour > 12 -> dt.hour - 12
+            else -> dt.hour
+        }
+        val minPart = if (dt.minute > 0) " ${dt.minute}분" else ""
+        return "${dt.monthValue}월 ${dt.dayOfMonth}일 $meridiem ${displayHour}시$minPart"
+    }
+
+    /**
+     * 구어체 추임새("아", "어", "음", "여보", "남편", "우리", "그", "그래서", "음 알겠어" 등)와
+     * 이미 요약문 앞쪽에 표시되는 날짜/시간 표현을 제거하고 핵심 용건 구절만 간결한 명사구로 요약합니다.
+     */
+    private fun extractCleanedCoreTopic(transcript: String, fallbackTitle: String, location: String?): String {
+        var text = transcript
+            // 날짜/시간 표현 먼저 제거 ("다음 주에", "21일이", "6시까지" 등)
+            .replace(Regex("""(?:이번\s*주|다음\s*주|내일모레|모레|내일|오늘)(?:에|에는|은|는)?\s*(?:[월화수목금토일]요일(?:에)?)?"""), " ")
+            .replace(Regex("""\d{1,2}\s*월\s*\d{1,2}\s*일(?:이|에|날|은|는)?"""), " ")
+            .replace(Regex("""(?<!\d)\d{1,2}\s*일(?:이|에|날|은|는)"""), " ")
+            .replace(Regex("""(?:오전|오후|아침|점심|저녁|밤)?\s*\d{1,2}\s*시(?:\s*\d{1,2}\s*분|\s*반)?(?:까지|에|쯤|부터)?"""), " ")
+            // 끝부분 대답/인사말 제거
+            .replace(
+                Regex("""(?:음|네|예|응|그래|어)?\s*(?:알겠어|알겠어요|알겠습니다|알았어|알았어요|그렇게\s*해요|그렇게\s*할게|이따\s*봐|수고하세요|끊을게|고마워).*$"""),
+                ""
+            )
+            // 구어체 호칭·감탄사·추임새 반복 제거
+            .replace(
+                Regex("""(?<=^|\s)(?:아|어|음|그|저기|에|응|네|예|여보|남편|자기야|자기|아내|엄마|아빠|우리|내가|제가|혹시|일단|근데|그래서|그러면|그럼|이제|진짜|정말|맞다|있잖아)(?=\s|$)"""),
+                " "
+            )
+            .replace(
+                Regex("""(?<=^|\s)(?:아|어|음|그|저기|에|응|네|예|여보|남편|자기야|자기|아내|엄마|아빠|우리|내가|제가|혹시|일단|근데|그래서|그러면|그럼|이제|진짜|정말|맞다|있잖아)(?=\s|$)"""),
+                " "
+            )
+            // 구어체 서술어 어미 제거 및 명사구 정규화
+            .replace("하원에서 등공하면", "하원")
+            .replace("하원에서 등원하면", "하원")
+            .replace("등공하면", "등원")
+            .replace(Regex("""(이거든|거든요|거든|잖아|잖아요|인데요|인데|더라고)"""), "")
+            .replace(Regex("""(하면\s*돼요|하면\s*돼|하면\s*됩니다|오면\s*돼요|오면\s*돼|가면\s*돼요|가면\s*돼)"""), "")
+            .replace(Regex("""(진행하시죠|보기로\s*했어|보기로|만나기로|만나요|시죠|봬요|할게요|드리겠습니다)"""), "")
+            .replace("하원에서", "하원")
+            .replace("등원에서", "등원")
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+
+        // 연속 중복 단어 제거
+        val words = text.split(" ").filter { it.isNotBlank() }
+        val deduped = mutableListOf<String>()
+        for (w in words) {
+            if (deduped.lastOrNull() != w) deduped.add(w)
+        }
+        text = deduped.joinToString(" ")
+            .removeSuffix("에서")
+            .removeSuffix("으로")
+            .removeSuffix("로")
+            .trim()
+
+        if (text.length > 32) {
+            text = text.take(32).trim()
+        }
+
+        return if (text.length >= 3) text else fallbackTitle
     }
 
     private fun cleanPlaceName(raw: String): String {
@@ -318,6 +453,8 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
             .removeSuffix("로")
             .removeSuffix("까지")
             .removeSuffix("하원")
+            .removeSuffix("등원")
+            .removeSuffix("등공")
             .trim()
     }
 
@@ -350,7 +487,6 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         var date = base.toLocalDate()
         var dateMatched = false
 
-        // 1. "X월 Y일" 체크
         val mdMatch = monthDayRegex.find(text)
         if (mdMatch != null) {
             val m = mdMatch.groupValues[1].toIntOrNull()
@@ -365,7 +501,6 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
             }
         }
 
-        // 2. "21일이", "21일에" 등 단독 일(day) 표현 체크
         if (!dateMatched) {
             val dMatch = dayOnlyRegex.find(text)
             if (dMatch != null) {
@@ -384,7 +519,6 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
             }
         }
 
-        // 3. 상대 날짜 ("오늘", "내일", "모레", "다음 주") 체크
         if (!dateMatched) {
             when {
                 text.contains("글피") -> { date = date.plusDays(3); dateMatched = true }
@@ -421,7 +555,7 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
                 "오후", "저녁", "밤" -> if (rawHour in 1..11) rawHour + 12 else rawHour
                 "오전", "아침" -> if (rawHour == 12) 0 else rawHour
                 "점심" -> if (rawHour in 1..3) rawHour + 12 else rawHour
-                else -> if (rawHour in 1..8) rawHour + 12 else rawHour // "6시까지 유치원 하원" 등 일상 시간은 오후(18시)로 자동 보정
+                else -> if (rawHour in 1..8) rawHour + 12 else rawHour
             }
             minute = when {
                 rawMin != null -> rawMin.coerceIn(0, 59)

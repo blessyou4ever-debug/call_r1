@@ -13,7 +13,7 @@ android {
         targetSdk = 34
         val runNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = 100 + runNumber
-        versionName = "2.3.$runNumber"
+        versionName = "2.4.$runNumber"
     }
 
     signingConfigs {

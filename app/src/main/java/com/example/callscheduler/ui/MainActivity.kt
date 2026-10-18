@@ -154,7 +154,7 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v2.3)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v2.4)", style = MaterialTheme.typography.titleLarge)
                                 Text(
                                     "삼성 기본전화 · SKT T전화/에이닷 파일명 완벽 호환 + 사용자 폴더 경로 설정",
                                     style = MaterialTheme.typography.bodySmall
