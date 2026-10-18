@@ -31,7 +31,7 @@ object CallFilenameParser {
         pattern = """^(?:\+?82[-_\s]?)?0?\d{1,2}[-_\s]?\d{3,4}[-_\s]?\d{4}$|^\d{7,13}$"""
     )
     private val INLINE_PHONE_CLEAN_REGEX = Regex(
-        pattern = """(?:\+?82[-_\s]?)?0\d{1,2}[-_\s]?\d{3,4}[-_\s]?\d{4}|(?<!\d)\d{8,13}(?!\d)"""
+        pattern = """(?:\+?82[-_\s]?)?0\d{1,2}[-_\s]?\d{3,4}[-_\s]?\d{4}|\b\d{8,13}\b"""
     )
 
     fun parse(file: File): CallMetadata {

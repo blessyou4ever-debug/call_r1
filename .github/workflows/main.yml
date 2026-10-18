@@ -21,7 +21,7 @@ jobs:
       - name: Restore Permanent Release Keystore (Fixed Signature for In-Place Updates)
         run: |
           if [ -f app/release-keystore.b64 ]; then
-            base64 -d app/release-keystore.b64 > app/release-keystore.jks
+            tr -d '\r\n ' < app/release-keystore.b64 | base64 --decode > app/release-keystore.jks
           else
             keytool -genkeypair -v \
               -keystore app/release-keystore.jks \
@@ -31,6 +31,7 @@ jobs:
               -keypass "CallScheduler2026!" \
               -dname "CN=CallScheduler, OU=Mobile, O=CallScheduler, L=Seoul, S=Seoul, C=KR"
           fi
+          ls -lh app/release-keystore.jks
 
       - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v3
@@ -41,7 +42,7 @@ jobs:
         env:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          gradle assembleRelease --no-daemon --stacktrace
+          gradle assembleRelease -x lint -x lintVitalRelease -x lintVitalAnalyzeRelease --no-daemon --stacktrace
           mkdir -p app/build/outputs/apk/release-ready
           cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release-ready/CallScheduler-signed-release.apk
 

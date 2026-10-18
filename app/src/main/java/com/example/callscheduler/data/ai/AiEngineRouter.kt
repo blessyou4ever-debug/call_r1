@@ -81,11 +81,10 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
 
                     val fullTranscript = segments.joinToString(" ").trim()
                     if (fullTranscript.isNotBlank()) {
-                        // 오디오 길이(초) 대비 인식된 글자 수를 확인하여 중간에 끊겼는지 신뢰도 계산
                         val expectedMinChars = (decoded.durationSeconds * 2.2f).toInt().coerceAtLeast(10)
                         val completenessRatio = (fullTranscript.length.toFloat() / expectedMinChars.toFloat()).coerceIn(0.2f, 1.0f)
                         val confidence = if (fullTranscript.length < 12 && decoded.durationSeconds >= 4f) {
-                            0.35f // 앞부분 2~3단어만 인식되고 끊긴 경우 낮은 신뢰도를 부여해 하이브리드 폴백 유도
+                            0.35f
                         } else {
                             (0.65f + 0.25f * completenessRatio).coerceAtMost(0.90f)
                         }
@@ -154,7 +153,6 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
                             val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                             val text = list?.firstOrNull()?.trim()
                             if (!text.isNullOrBlank()) {
-                                // 이전 partial보다 짧아졌다는 것은 내부 세그먼트가 넘어갔음을 의미하므로 이전 partial 보존
                                 if (latestPartial.length >= 6 && text.length < latestPartial.length / 2) {
                                     collectedPieces.add(latestPartial)
                                 }
@@ -223,12 +221,25 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
 
 class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor {
 
-    // 단독 장소명("유치원", "어린이집", "병원", "치과" 등)과 복합 장소명("판교역 스타벅스", "해피유치원") 모두 추출
     private val locationRegex = Regex("""([가-힣0-9A-Za-z]{0,15}(?:유치원|어린이집|초등학교|중학교|고등학교|학교|학원|역|카페|스타벅스|투썸|사무실|빌딩|회의실|병원|의원|치과|식당|레스토랑|호텔|센터|지점|본사|호점|공원|마트|백화점|공항|터미널)(?:\s*[가-힣0-9A-Za-z]{1,10})?)""")
     private val atLocationRegex = Regex("""([가-힣0-9A-Za-z\s]{2,15})에서\s*(?:만나|미팅|보기로|뵙|모임|진행|식사|회의|하원|등원|출발|집합|모여)""")
     private val monthDayRegex = Regex("""(\d{1,2})\s*월\s*(\d{1,2})\s*일""")
-    private val dayOnlyRegex = Regex("""(?<!\d)(\d{1,2})\s*일(?:이|에|날|\s|$)""")
+    private val dayOnlyRegex = Regex("""(?:^|\s)(\d{1,2})\s*일(?:이|에|날|\s|$)""")
     private val timeRegex = Regex("""(오전|오후|아침|점심|저녁|밤)?\s*(\d{1,2})\s*시(?:\s*(\d{1,2})\s*분|\s*(반))?""")
+
+    private val relativeDateCleanRegex = Regex("""(?:이번\s*주|다음\s*주|내일모레|모레|내일|오늘)(?:에|에는|은|는)?\s*(?:[월화수목금토일]요일(?:에)?)?""")
+    private val monthDayCleanRegex = Regex("""\d{1,2}\s*월\s*\d{1,2}\s*일(?:이|에|날|은|는)?""")
+    private val dayOnlyCleanRegex = Regex("""(?:^|\s)\d{1,2}\s*일(?:이|에|날|은|는)""")
+    private val timeCleanRegex = Regex("""(?:오전|오후|아침|점심|저녁|밤)?\s*\d{1,2}\s*시(?:\s*\d{1,2}\s*분|\s*반)?(?:까지|에|쯤|부터)?""")
+    private val closingCleanRegex = Regex("""(?:음|네|예|응|그래|어)?\s*(?:알겠어|알겠어요|알겠습니다|알았어|알았어요|그렇게\s*해요|그렇게\s*할게|이따\s*봐|수고하세요|끊을게|고마워).*$""")
+    private val endingCleanRegex = Regex("""(이거든|거든요|거든|잖아|잖아요|인데요|인데|더라고|하면\s*돼요|하면\s*돼|하면\s*됩니다|오면\s*돼요|오면\s*돼|가면\s*돼요|가면\s*돼|진행하시죠|보기로\s*했어|보기로|만나기로|만나요|시죠|봬요|할게요|드리겠습니다)""")
+    private val multiSpaceRegex = Regex("""\s+""")
+
+    private val stopWords = setOf(
+        "아", "어", "음", "그", "저기", "에", "응", "네", "예", "여보", "남편", "자기야", "자기",
+        "아내", "엄마", "아빠", "우리", "내가", "제가", "혹시", "일단", "근데", "그래서", "그러면",
+        "그럼", "이제", "진짜", "정말", "맞다", "있잖아", "돼", "돼요", "됩니다"
+    )
 
     private val appointmentKeywords = listOf(
         "약속", "미팅", "만나", "시죠", "봬요", "회의", "식사", "보기로",
@@ -338,10 +349,6 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         }
     }
 
-    /**
-     * 통화 원문(구어체 필러·호칭·인사말 포함)을 그대로 넣지 않고,
-     * 핵심 일시·장소·용건만 추려 1줄의 깔끔한 요약문으로 변환합니다.
-     */
     private fun summarizeAppointment(
         contactName: String,
         start: LocalDateTime,
@@ -350,10 +357,10 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         transcript: String
     ): String {
         val dateTimeLabel = formatKoreanFriendlyDateTime(start)
-        val coreTopic = extractCleanedCoreTopic(transcript, title, location)
+        val coreTopic = extractCleanedCoreTopic(transcript, title)
         val locPart = if (!location.isNullOrBlank() && !coreTopic.contains(location)) " $location에서" else ""
         return "${contactName}님과 통화 중 $dateTimeLabel$locPart $coreTopic 일정 확인"
-            .replace(Regex("""\s{2,}"""), " ")
+            .replace(multiSpaceRegex, " ")
             .trim()
     }
 
@@ -363,9 +370,9 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         transcript: String
     ): String {
         val dateTimeLabel = formatKoreanFriendlyDateTime(callbackTime)
-        val coreTopic = extractCleanedCoreTopic(transcript, "논의 사항", null)
+        val coreTopic = extractCleanedCoreTopic(transcript, "논의 사항")
         return "${contactName}님과 통화 중 $dateTimeLabel $coreTopic 관련 다시 연락하기로 확인"
-            .replace(Regex("""\s{2,}"""), " ")
+            .replace(multiSpaceRegex, " ")
             .trim()
     }
 
@@ -373,9 +380,9 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         contactName: String,
         transcript: String
     ): String {
-        val coreTopic = extractCleanedCoreTopic(transcript, "요청 사항", null)
+        val coreTopic = extractCleanedCoreTopic(transcript, "요청 사항")
         return "${contactName}님과 통화 중 $coreTopic 처리 및 확인 필요"
-            .replace(Regex("""\s{2,}"""), " ")
+            .replace(multiSpaceRegex, " ")
             .trim()
     }
 
@@ -390,48 +397,29 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         return "${dt.monthValue}월 ${dt.dayOfMonth}일 $meridiem ${displayHour}시$minPart"
     }
 
-    /**
-     * 구어체 추임새("아", "어", "음", "여보", "남편", "우리", "그", "그래서", "음 알겠어" 등)와
-     * 이미 요약문 앞쪽에 표시되는 날짜/시간 표현을 제거하고 핵심 용건 구절만 간결한 명사구로 요약합니다.
-     */
-    private fun extractCleanedCoreTopic(transcript: String, fallbackTitle: String, location: String?): String {
+    private fun extractCleanedCoreTopic(transcript: String, fallbackTitle: String): String {
         var text = transcript
-            // 날짜/시간 표현 먼저 제거 ("다음 주에", "21일이", "6시까지" 등)
-            .replace(Regex("""(?:이번\s*주|다음\s*주|내일모레|모레|내일|오늘)(?:에|에는|은|는)?\s*(?:[월화수목금토일]요일(?:에)?)?"""), " ")
-            .replace(Regex("""\d{1,2}\s*월\s*\d{1,2}\s*일(?:이|에|날|은|는)?"""), " ")
-            .replace(Regex("""(?<!\d)\d{1,2}\s*일(?:이|에|날|은|는)"""), " ")
-            .replace(Regex("""(?:오전|오후|아침|점심|저녁|밤)?\s*\d{1,2}\s*시(?:\s*\d{1,2}\s*분|\s*반)?(?:까지|에|쯤|부터)?"""), " ")
-            // 끝부분 대답/인사말 제거
-            .replace(
-                Regex("""(?:음|네|예|응|그래|어)?\s*(?:알겠어|알겠어요|알겠습니다|알았어|알았어요|그렇게\s*해요|그렇게\s*할게|이따\s*봐|수고하세요|끊을게|고마워).*$"""),
-                ""
-            )
-            // 구어체 호칭·감탄사·추임새 반복 제거
-            .replace(
-                Regex("""(?<=^|\s)(?:아|어|음|그|저기|에|응|네|예|여보|남편|자기야|자기|아내|엄마|아빠|우리|내가|제가|혹시|일단|근데|그래서|그러면|그럼|이제|진짜|정말|맞다|있잖아)(?=\s|$)"""),
-                " "
-            )
-            .replace(
-                Regex("""(?<=^|\s)(?:아|어|음|그|저기|에|응|네|예|여보|남편|자기야|자기|아내|엄마|아빠|우리|내가|제가|혹시|일단|근데|그래서|그러면|그럼|이제|진짜|정말|맞다|있잖아)(?=\s|$)"""),
-                " "
-            )
-            // 구어체 서술어 어미 제거 및 명사구 정규화
+            .replace(relativeDateCleanRegex, " ")
+            .replace(monthDayCleanRegex, " ")
+            .replace(dayOnlyCleanRegex, " ")
+            .replace(timeCleanRegex, " ")
+            .replace(closingCleanRegex, "")
             .replace("하원에서 등공하면", "하원")
             .replace("하원에서 등원하면", "하원")
             .replace("등공하면", "등원")
-            .replace(Regex("""(이거든|거든요|거든|잖아|잖아요|인데요|인데|더라고)"""), "")
-            .replace(Regex("""(하면\s*돼요|하면\s*돼|하면\s*됩니다|오면\s*돼요|오면\s*돼|가면\s*돼요|가면\s*돼)"""), "")
-            .replace(Regex("""(진행하시죠|보기로\s*했어|보기로|만나기로|만나요|시죠|봬요|할게요|드리겠습니다)"""), "")
+            .replace(endingCleanRegex, "")
             .replace("하원에서", "하원")
             .replace("등원에서", "등원")
-            .replace(Regex("""\s{2,}"""), " ")
             .trim()
 
-        // 연속 중복 단어 제거
-        val words = text.split(" ").filter { it.isNotBlank() }
+        val tokens = text.split(multiSpaceRegex)
         val deduped = mutableListOf<String>()
-        for (w in words) {
-            if (deduped.lastOrNull() != w) deduped.add(w)
+        for (rawTok in tokens) {
+            val tok = rawTok.trim()
+            if (tok.isEmpty() || tok in stopWords) continue
+            if (deduped.lastOrNull() != tok) {
+                deduped.add(tok)
+            }
         }
         text = deduped.joinToString(" ")
             .removeSuffix("에서")
@@ -654,10 +642,6 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         }
     }
 
-    /**
-     * Gemini가 {"transcript": "..."} 객체 또는 [{"transcript": "..."}] 배열 어느 쪽으로 응답하더라도
-     * JSON 괄호 없이 순수 한국어 텍스트만 추출합니다.
-     */
     private fun unwrapTranscriptJson(raw: String): String {
         val cleaned = raw.trim()
             .removePrefix("```json")
@@ -910,8 +894,6 @@ class HybridCallAiProcessor(
                 }
             }
 
-            // 만약 온디바이스 STT가 앞부분 몇 글자("어 남편 음" 등)만 인식하고 끊겨서 일정이 0건으로 나왔는데
-            // API 키가 등록되어 있다면, 자동으로 클라우드 오디오 STT로 재인식하여 누락된 일정을 구제합니다.
             if (actions.isEmpty() && sttResult.engineName == "ANDROID_ON_DEVICE_STT" && sttResult.transcript.length < 25 && hasApiKey) {
                 val rescuedStt = cloudEngine.transcribe(audioFile).getOrNull()
                 if (rescuedStt != null && rescuedStt.transcript.length > sttResult.transcript.length) {

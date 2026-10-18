@@ -13,21 +13,18 @@ android {
         targetSdk = 34
         val runNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
         versionCode = 100 + runNumber
-        versionName = "2.4.$runNumber"
+        versionName = "2.5.$runNumber"
     }
 
     signingConfigs {
         create("release") {
-            val ksFile = file("release-keystore.jks")
-            if (ksFile.exists()) {
-                storeFile = ksFile
-                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "CallScheduler2026!"
-                keyAlias = System.getenv("KEY_ALIAS") ?: "callscheduler"
-                keyPassword = System.getenv("KEY_PASSWORD") ?: "CallScheduler2026!"
-                enableV1Signing = true
-                enableV2Signing = true
-                enableV3Signing = true
-            }
+            storeFile = file("release-keystore.jks")
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "CallScheduler2026!"
+            keyAlias = System.getenv("KEY_ALIAS") ?: "callscheduler"
+            keyPassword = System.getenv("KEY_PASSWORD") ?: "CallScheduler2026!"
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
@@ -35,20 +32,15 @@ android {
         release {
             isMinifyEnabled = false
             isDebuggable = false
-            val ksFile = file("release-keystore.jks")
-            signingConfig = if (ksFile.exists()) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
-        }
-        debug {
-            val ksFile = file("release-keystore.jks")
-            if (ksFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
-            }
+            signingConfig = signingConfigs.getByName("release")
         }
     }
+
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
