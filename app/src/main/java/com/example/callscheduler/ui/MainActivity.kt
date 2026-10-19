@@ -65,6 +65,7 @@ class MainActivity : ComponentActivity() {
                 val currentMode by settingsDataStore.engineModeFlow.collectAsState(initial = EngineMode.AUTO_FALLBACK)
                 val apiKey by settingsDataStore.apiKeyFlow.collectAsState(initial = "")
                 val customCallDir by settingsDataStore.customCallDirFlow.collectAsState(initial = "")
+                val preferredModel by settingsDataStore.preferredModelFlow.collectAsState(initial = "gemini-3.8-flash")
                 val actionItems by dao.observeAllActionItems().collectAsState(initial = emptyList())
                 val callRecords by dao.observeAllCallRecords().collectAsState(initial = emptyList())
 
@@ -156,9 +157,9 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v2.9)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v3.0)", style = MaterialTheme.typography.titleLarge)
                                 Text(
-                                    "Gemini API 실패 원인 상세 표시 + [Gemini API로 재시도] 전용 버튼 및 실시간 연결 진단",
+                                    "최신 gemini-3.8-flash 기본 탑재 + [Gemini API로 재시도] 전용 버튼 및 연결 진단",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -347,10 +348,14 @@ class MainActivity : ComponentActivity() {
                                     }
 
                                     if (currentMode != EngineMode.ON_DEVICE) {
+                                        Text(
+                                            "현재 우선 호출 모델: ${preferredModel} (구버전 2.5 차단 해결 완료)",
+                                            style = MaterialTheme.typography.labelMedium
+                                        )
                                         OutlinedTextField(
                                             value = apiKeyInput,
                                             onValueChange = { apiKeyInput = it },
-                                            label = { Text("Gemini API Key (실패 시 원인 표시 및 온디바이스 자동전환)") },
+                                            label = { Text("Gemini API Key (gemini-3.8-flash 우선 호출)") },
                                             modifier = Modifier.fillMaxWidth(),
                                             singleLine = true
                                         )
@@ -371,7 +376,7 @@ class MainActivity : ComponentActivity() {
                                                     scope.launch {
                                                         settingsDataStore.setGeminiApiKey(apiKeyInput)
                                                         isDiagnosingApi = true
-                                                        apiDiagnosticReport = "Gemini API 서버 및 활성 모델 연결 상태를 확인하는 중입니다..."
+                                                        apiDiagnosticReport = "gemini-3.8-flash 및 최신 모델로 연결을 확인하는 중입니다..."
                                                         val res = cloudDiagnosticEngine.diagnoseApiConnection(apiKeyInput)
                                                         apiDiagnosticReport = res.getOrElse { "❌ 진단 중 예외 발생: ${it.message}" }
                                                         isDiagnosingApi = false
@@ -537,7 +542,7 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                     Toast.makeText(
                                                         this@MainActivity,
-                                                        "폴백·실패 항목 ${count}건을 Gemini API로 일괄 재시도합니다.",
+                                                        "폴백·실패 항목 ${count}건을 gemini-3.8-flash API로 일괄 재시도합니다.",
                                                         Toast.LENGTH_SHORT
                                                     ).show()
                                                 }
@@ -547,7 +552,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
                                     Text(
-                                        "API 실패로 온디바이스로 자동 전환된 경우에도 실패 원인이 아래 로그에 함께 표시되며, [Gemini API로 재시도] 버튼으로 API만 단독 재호출할 수 있습니다.",
+                                        "이제 [Gemini API로 재시도]를 누르면 구버전(2.5) 대신 최신 gemini-3.8-flash 모델로 즉시 호출합니다.",
                                         style = MaterialTheme.typography.bodySmall
                                     )
                                 }
@@ -566,7 +571,7 @@ class MainActivity : ComponentActivity() {
                                             )
                                             Toast.makeText(
                                                 this@MainActivity,
-                                                "${rec.contactName} 통화 녹음을 Gemini API로 재시도합니다...",
+                                                "${rec.contactName} 통화 녹음을 Gemini API(${preferredModel})로 재시도합니다...",
                                                 Toast.LENGTH_SHORT
                                             ).show()
                                         } else {

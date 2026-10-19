@@ -583,16 +583,21 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
 class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : SttEngine, ScheduleExtractor {
 
     companion object {
+        // Google 서버가 신규/현재 계정에 권장하는 최신 gemini-3.8-flash 모델을 최우선 1순위로 배치하고,
+        // 신규 사용자에게 404 차단된 구버전(gemini-2.5-flash 등)은 가장 마지막 후순위로 배치합니다.
         private val CANDIDATE_MODELS = listOf(
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-            "gemini-1.5-flash",
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-lite",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite-preview",
             "gemini-3-flash-preview",
-            "gemini-3.1-flash-lite-preview"
+            "gemini-2.5-flash"
         )
+        private val USE_MODEL_REGEX = Regex("""use\s+models/([a-zA-Z0-9._-]+)""", RegexOption.IGNORE_CASE)
         private val SUGGESTED_MODEL_REGEX = Regex("""models/([a-zA-Z0-9._-]+)""")
+        private val VERSION_EXTRACT_REGEX = Regex("""gemini-(\d+(?:\.\d+)?)""")
     }
 
     private fun isAudioCapableModelName(name: String): Boolean {
@@ -603,8 +608,24 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
     }
 
     /**
+     * 모델 버전 숫자를 파싱하여 최신 3.8 -> 3.6 -> 3.5 순으로 정렬하고,
+     * 구버전(2.5 / 2.0 / 1.5)은 신규 계정에서 404 NOT_FOUND를 일으키므로 우선순위를 맨 뒤로 낮춥니다.
+     */
+    private fun computeModelPriorityScore(modelName: String, preferredModel: String): Double {
+        val clean = modelName.removePrefix("models/").lowercase()
+        if (clean == preferredModel.lowercase()) return 1000.0
+        if (clean == "gemini-3.8-flash") return 950.0
+        val versionNum = VERSION_EXTRACT_REGEX.find(clean)?.groupValues?.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+        val litePenalty = if (clean.contains("lite")) -0.05 else 0.0
+        val previewPenalty = if (clean.contains("preview") || clean.contains("exp")) -0.08 else 0.0
+        // 2.5 이하 구버전은 신규 계정에서 404 차단되므로 3.x 모델들보다 항상 뒤에 오도록 처리
+        val legacyPenalty = if (versionNum in 0.1..2.9) -50.0 else 0.0
+        return versionNum * 10.0 + litePenalty + previewPenalty + legacyPenalty
+    }
+
+    /**
      * 사용자가 설정 화면에서 [API 키 · 모델 연결 진단] 버튼을 눌렀을 때
-     * 실제 Google 서버에 모델 목록 조회 및 경량 테스트 호출을 수행하여 정확한 상태나 오류 원인을 반환합니다.
+     * gemini-3.8-flash 및 최신 모델로 실제 호출을 검증하고 성공한 모델을 기본 모델로 즉시 고정합니다.
      */
     suspend fun diagnoseApiConnection(apiKeyOverride: String? = null): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
@@ -613,35 +634,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 return@runCatching "❌ Gemini API 키가 비어 있습니다. 먼저 API 키를 입력하고 저장해 주세요."
             }
 
-            val listUrl = URL("https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}")
-            val listConn = (listUrl.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 12_000
-                readTimeout = 12_000
-            }
-            val listCode = listConn.responseCode
-            if (listCode !in 200..299) {
-                val errRaw = runCatching { listConn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
-                val cleanErr = extractCleanGoogleErrorMessage(errRaw)
-                return@runCatching "❌ API 키 인증 또는 모델 목록 조회 실패 (HTTP ${listCode})\n• 원인: ${cleanErr}"
-            }
-
-            val body = listConn.inputStream.bufferedReader().use { it.readText() }
-            val modelsJson = JSONObject(body).optJSONArray("models") ?: JSONArray()
-            val audioModels = mutableListOf<String>()
-            for (i in 0 until modelsJson.length()) {
-                val m = modelsJson.getJSONObject(i)
-                val name = m.optString("name", "").removePrefix("models/")
-                val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
-                if (isAudioCapableModelName(name) && methods.contains("generateContent")) {
-                    audioModels.add(name)
-                }
-            }
-
-            val primaryModel = audioModels.firstOrNull { it == "gemini-2.5-flash" }
-                ?: audioModels.firstOrNull()
-                ?: "gemini-2.5-flash"
-
+            val discovered = discoverAvailableFlashModels(apiKey)
             val testPayload = JSONObject().apply {
                 put(
                     "contents",
@@ -655,15 +648,21 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             }.toString()
 
             return@runCatching try {
-                val reply = callSingleModel(apiKey, primaryModel, testPayload).trim()
-                "✅ Gemini API 정상 연결 확인!\n" +
-                    "• 대표 활성 모델: ${primaryModel}\n" +
-                    "• 테스트 응답: ${reply.take(40)}\n" +
-                    "• 계정의 오디오 지원 Flash 모델(${audioModels.size}개): ${audioModels.take(5).joinToString(", ")}"
+                val (reply, winningModel) = postGeminiJsonWithFallback(apiKey, testPayload)
+                settingsDataStore.setPreferredModelSync(winningModel)
+                "✅ Gemini API 정상 연결 및 최신 모델 자동 적용 완료!\n" +
+                    "• 연결 성공 모델(자동 고정됨): ${winningModel}\n" +
+                    "• 테스트 응답: ${reply.trim().take(40)}\n" +
+                    "• 이제 모든 통화 녹음 STT와 일정 추출이 [${winningModel}] 모델로 즉시 동작합니다."
             } catch (e: Exception) {
-                "⚠️ 모델 목록 조회는 성공했으나 실제 생성 호출에서 오류가 발생했습니다.\n" +
-                    "• 시도 모델: ${primaryModel}\n" +
-                    "• 상세 오류: ${e.message}"
+                val modelListNote = if (discovered.isNotEmpty()) {
+                    "조회된 모델: ${discovered.take(5).joinToString(", ")}"
+                } else {
+                    "모델 목록 조회 실패"
+                }
+                "❌ Gemini API 생성 호출 실패\n" +
+                    "• ${e.message}\n" +
+                    "• (${modelListNote})"
             }
         }
     }
@@ -680,23 +679,24 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             val audioBytes = audioOrPcmFile.readBytes()
             val base64Audio = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
 
+            // 1차 시도: gemini-3.8-flash 등 최신 모델과 완벽 호환되도록 불필요한 responseMimeType 강제를 제거하고 순수 텍스트/JSON 유연 수신
             val firstAttempt = runCatching {
-                requestAudioTranscription(apiKey, mimeType, base64Audio, useJsonMimeConfig = true)
+                requestAudioTranscription(apiKey, mimeType, base64Audio, useJsonMimeConfig = false)
             }
 
-            val responseText = if (firstAttempt.isSuccess) {
+            val (responseText, usedModel) = if (firstAttempt.isSuccess) {
                 firstAttempt.getOrThrow()
             } else {
                 val firstErr = firstAttempt.exceptionOrNull()
                 val errMsg = firstErr?.message ?: ""
-                // 만약 .m4u / 특이 오디오 포맷 거부(HTTP 400) 또는 JSON MIME 충돌이면 표준 WAV(audio/wav)로 디코딩하여 재시도
-                if (errMsg.contains("HTTP 400") || errMsg.contains("INVALID_ARGUMENT") || errMsg.contains("format")) {
+                // 만약 .m4u / 특이 오디오 포맷 거부(HTTP 400)이면 표준 16-bit PCM WAV(audio/wav)로 즉시 디코딩하여 재시도
+                if (errMsg.contains("HTTP 400") || errMsg.contains("INVALID_ARGUMENT") || errMsg.contains("format") || errMsg.contains("audio")) {
                     val wavAttempt = AudioPcmDecoder.transcodeToWavBytes(audioOrPcmFile)
                     if (wavAttempt.isSuccess) {
                         val wavBase64 = Base64.encodeToString(wavAttempt.getOrThrow(), Base64.NO_WRAP)
                         requestAudioTranscription(apiKey, "audio/wav", wavBase64, useJsonMimeConfig = false)
                     } else {
-                        requestAudioTranscription(apiKey, mimeType, base64Audio, useJsonMimeConfig = false)
+                        throw firstErr ?: IllegalStateException("Gemini 오디오 STT 호출 실패")
                     }
                 } else {
                     throw firstErr ?: IllegalStateException("Gemini 오디오 STT 호출 실패")
@@ -704,12 +704,12 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             }
 
             val parsedTranscript = unwrapTranscriptJson(responseText)
-            require(parsedTranscript.isNotBlank()) { "Gemini API가 빈 텍스트를 반환했습니다." }
+            require(parsedTranscript.isNotBlank()) { "Gemini API(${usedModel})가 빈 텍스트를 반환했습니다." }
 
             SttResult(
                 transcript = parsedTranscript,
-                confidence = 0.96f,
-                engineName = "CLOUD_GEMINI_AUDIO"
+                confidence = 0.97f,
+                engineName = "CLOUD_GEMINI (${usedModel})"
             )
         }
     }
@@ -719,7 +719,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         mimeType: String,
         base64Audio: String,
         useJsonMimeConfig: Boolean
-    ): String {
+    ): Pair<String, String> {
         val parts = JSONArray().apply {
             put(
                 JSONObject().put(
@@ -732,7 +732,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             put(
                 JSONObject().put(
                     "text",
-                    "이 통화 녹음 오디오를 한국어로 빠짐없이 받아쓰기(STT)한 뒤 JSON 객체 {\"transcript\": \"전체 통화 내용\"} 형식으로만 응답하세요."
+                    "이 통화 녹음 오디오의 대화 내용을 한국어로 빠짐없이 받아쓰기(STT)해 주세요. 부연 설명 없이 실제 통화 대화 내용 텍스트만 그대로 출력하세요."
                 )
             )
         }
@@ -785,62 +785,77 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             require(apiKey.isNotBlank()) { "Gemini API 키가 설정되지 않았습니다." }
 
             val prompt = buildExtractionPrompt(metadata, transcript)
-            val requestJson = JSONObject().apply {
+            val jsonMimeRequest = JSONObject().apply {
                 put("contents", JSONArray().put(
                     JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))
                 ))
                 put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
             }.toString()
 
-            val textContent = postGeminiJsonWithFallback(apiKey, requestJson)
+            val plainRequest = JSONObject().apply {
+                put("contents", JSONArray().put(
+                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))
+                ))
+            }.toString()
+
+            val (textContent, _) = runCatching {
+                postGeminiJsonWithFallback(apiKey, jsonMimeRequest)
+            }.recoverCatching {
+                postGeminiJsonWithFallback(apiKey, plainRequest)
+            }.getOrThrow()
+
             parseExtractedActionsJson(textContent)
         }
     }
 
-    private suspend fun postGeminiJsonWithFallback(apiKey: String, requestJson: String): String {
-        // 1단계: 현재 API 키로 사용 가능한 실제 Flash 모델 목록을 먼저 빠르게 조회하여 폐기된 모델(404) 호출을 방지
+    private suspend fun postGeminiJsonWithFallback(apiKey: String, requestJson: String): Pair<String, String> {
+        val preferred = settingsDataStore.getPreferredModel().ifBlank { "gemini-3.8-flash" }
         val discovered = discoverAvailableFlashModels(apiKey)
-        val orderedModels = LinkedHashSet<String>()
-        if (discovered.isNotEmpty()) {
-            // 검증된 정식 모델을 우선 배치
-            CANDIDATE_MODELS.filter { it in discovered }.forEach { orderedModels.add(it) }
-            discovered.forEach { orderedModels.add(it) }
-        } else {
-            orderedModels.addAll(CANDIDATE_MODELS)
-        }
 
-        var primaryError: Exception? = null
+        // 후보 모델 풀을 합친 뒤 최신 3.8 Flash 모델이 무조건 맨 앞에 오도록 점수순 정렬
+        val combinedPool = LinkedHashSet<String>().apply {
+            add(preferred)
+            add("gemini-3.8-flash")
+            addAll(CANDIDATE_MODELS)
+            addAll(discovered)
+        }.filter { isAudioCapableModelName(it) }
+            .sortedByDescending { computeModelPriorityScore(it, preferred) }
+
+        val triedModels = mutableSetOf<String>()
         val errorTraces = mutableListOf<String>()
+        var primaryError: Exception? = null
 
-        for (modelName in orderedModels.toList()) {
+        val queue = ArrayDeque<String>(combinedPool)
+        while (queue.isNotEmpty()) {
+            val modelName = queue.removeFirst().removePrefix("models/")
+            if (!triedModels.add(modelName)) continue
+
             try {
-                return callSingleModel(apiKey, modelName, requestJson)
+                val responseText = callSingleModel(apiKey, modelName, requestJson)
+                // 호출에 성공한 최신 모델(예: gemini-3.8-flash)을 즉시 기본 모델로 저장하여 다음 호출부터 0초 직행
+                settingsDataStore.setPreferredModelSync(modelName)
+                return Pair(responseText, modelName)
             } catch (e: GeminiRetryableHttpException) {
                 if (primaryError == null || e.statusCode != 404) {
                     primaryError = e
                 }
                 errorTraces.add("${modelName}(HTTP ${e.statusCode}: ${e.cleanReason.take(90)})")
 
-                // 401/403 API 키 자체 오류는 다른 모델을 찔러도 동일하므로 즉시 중단하여 빠른 에러 리포트 제공
                 if (e.statusCode == 401 || e.statusCode == 403 || e.cleanReason.contains("API_KEY_INVALID")) {
                     break
                 }
 
-                if (e.statusCode == 404) {
-                    val suggested = SUGGESTED_MODEL_REGEX.findAll(e.errorBody)
+                // 서버가 "Please update your code to use models/gemini-3.8-flash" 처럼 대체 모델을 지정해 준 경우 큐의 맨 앞(1순위)에 즉시 삽입!
+                val explicitRecommended = USE_MODEL_REGEX.find(e.errorBody)?.groupValues?.getOrNull(1)
+                    ?: SUGGESTED_MODEL_REGEX.findAll(e.errorBody)
                         .map { it.groupValues[1] }
                         .firstOrNull { it != modelName && isAudioCapableModelName(it) }
-                    if (suggested != null && !orderedModels.contains(suggested)) {
-                        try {
-                            return callSingleModel(apiKey, suggested, requestJson)
-                        } catch (inner: GeminiRetryableHttpException) {
-                            errorTraces.add("${suggested}(HTTP ${inner.statusCode}: ${inner.cleanReason.take(80)})")
-                        } catch (inner: Exception) {
-                            errorTraces.add("${suggested}(${inner.message?.take(80)})")
-                        }
-                    }
+
+                if (!explicitRecommended.isNullOrBlank() && explicitRecommended !in triedModels) {
+                    queue.addFirst(explicitRecommended)
+                    continue
                 }
-                delay(250L)
+                delay(200L)
             } catch (e: Exception) {
                 if (primaryError == null) primaryError = e
                 errorTraces.add("${modelName}(${e.message?.take(90)})")
@@ -864,9 +879,9 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 val msg = errObj.optString("message", rawErrorBody)
                 if (status.isNotBlank()) "[${status}] ${msg}" else msg
             } else {
-                rawErrorBody.replace(Regex("\\s+"), " ").take(200)
+                rawErrorBody.replace(Regex("\\s+"), " ").take(220)
             }
-        }.getOrDefault(rawErrorBody.replace(Regex("\\s+"), " ").take(200))
+        }.getOrDefault(rawErrorBody.replace(Regex("\\s+"), " ").take(220))
     }
 
     private inner class GeminiRetryableHttpException(
@@ -912,7 +927,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             ?.optJSONArray("parts")
             ?: throw IllegalStateException("응답에 content.parts가 없습니다 (${cleanModel})")
 
-        // Gemini 2.5 / 3.x 모델의 Thinking 파트("thought": true)를 건너뛰고 실제 텍스트 파트만 추출
+        // Gemini 3.8 / 3.x 모델의 Thinking 파트("thought": true)를 건너뛰고 실제 출력 텍스트 파트만 추출
         var fallbackText = ""
         for (i in 0 until parts.length()) {
             val partObj = parts.optJSONObject(i) ?: continue
@@ -939,6 +954,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         if (conn.responseCode !in 200..299) return@runCatching emptyList()
         val body = conn.inputStream.bufferedReader().use { it.readText() }
         val models = JSONObject(body).optJSONArray("models") ?: return@runCatching emptyList()
+        val preferred = settingsDataStore.getPreferredModel()
         val found = mutableListOf<String>()
         for (i in 0 until models.length()) {
             val m = models.getJSONObject(i)
@@ -948,15 +964,29 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 found.add(name)
             }
         }
-        found
+        found.sortedByDescending { computeModelPriorityScore(it, preferred) }
     }.getOrDefault(emptyList())
 
     private fun parseExtractedActionsJson(rawJson: String): List<ExtractedActionDto> {
-        val cleaned = rawJson.trim()
+        var cleaned = rawJson.trim()
             .removePrefix("```json")
             .removePrefix("```")
             .removeSuffix("```")
             .trim()
+
+        // 모델이 JSON 배열 앞뒤로 설명 문구를 덧붙인 경우에도 대괄호 [...] 또는 중괄호 {...} 구간만 안전하게 추출
+        val firstBracket = cleaned.indexOf('[')
+        val lastBracket = cleaned.lastIndexOf(']')
+        if (firstBracket >= 0 && lastBracket > firstBracket) {
+            cleaned = cleaned.substring(firstBracket, lastBracket + 1)
+        } else {
+            val firstBrace = cleaned.indexOf('{')
+            val lastBrace = cleaned.lastIndexOf('}')
+            if (firstBrace >= 0 && lastBrace > firstBrace) {
+                cleaned = cleaned.substring(firstBrace, lastBrace + 1)
+            }
+        }
+
         val array = if (cleaned.startsWith("{")) {
             JSONObject(cleaned).optJSONArray("actions") ?: JSONArray()
         } else {
@@ -964,7 +994,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         }
         val list = mutableListOf<ExtractedActionDto>()
         for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
+            val obj = array.optJSONObject(i) ?: continue
             list.add(
                 ExtractedActionDto(
                     actionType = obj.optString("actionType", "APPOINTMENT"),
@@ -1010,13 +1040,6 @@ class HybridCallAiProcessor(
     private val onDeviceExtractor: ScheduleExtractor,
     private val cloudEngine: CloudGeminiEngine
 ) {
-    /**
-     * 1) forceCloudOnly == true ([Gemini API로 재시도] 버튼 클릭 시):
-     *    온디바이스로 넘어가지 않고 오직 Gemini API로만 분석을 시도하며, 실패 시 정확한 Gemini API 오류를 그대로 반환합니다.
-     * 2) 일반 자동 실행 시:
-     *    Gemini API가 실패하면 즉시 온디바이스로 자동 전환하되, 왜 API가 실패했는지 상세 오류 로그(cloudSttErrorDetail)를
-     *    결과 원문 하단에 반드시 함께 기록하여 사용자가 원인을 투명하게 확인할 수 있게 합니다.
-     */
     suspend fun process(
         audioFile: File,
         metadata: CallMetadata,
@@ -1033,13 +1056,13 @@ class HybridCallAiProcessor(
                 val cloudActions = cloudEngine.extractActions(metadata, cloudStt.transcript).recoverCatching {
                     onDeviceExtractor.extractActions(metadata, cloudStt.transcript).getOrThrow()
                 }.getOrThrow()
-                return@runCatching Triple(cloudStt.transcript, "CLOUD_GEMINI_AUDIO (API 재시도 성공)", cloudActions)
+                return@runCatching Triple(cloudStt.transcript, "${cloudStt.engineName} (API 성공)", cloudActions)
             }
 
             var switchedFromCloudError = false
             var cloudErrorDiagnostic: String? = null
 
-            var sttResult = when (mode) {
+            val sttResult = when (mode) {
                 EngineMode.ON_DEVICE -> {
                     onDeviceStt.transcribe(audioFile).getOrThrow()
                 }
@@ -1051,7 +1074,6 @@ class HybridCallAiProcessor(
                         } else {
                             switchedFromCloudError = true
                             cloudErrorDiagnostic = cloudAttempt.exceptionOrNull()?.message ?: "알 수 없는 Gemini API 오류"
-                            // 온디바이스로 자동 전환 시도 (최대 2회) & 만약 온디바이스도 실패하면 1차 API 오류와 2차 온디바이스 오류를 모두 표시!
                             val localAttempt = onDeviceStt.transcribe(audioFile).recoverCatching {
                                 delay(400L)
                                 onDeviceStt.transcribe(audioFile).getOrThrow()
