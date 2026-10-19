@@ -28,6 +28,7 @@ import androidx.work.Data
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
+import com.example.callscheduler.data.ai.CloudGeminiEngine
 import com.example.callscheduler.data.calendar.CalendarSyncResult
 import com.example.callscheduler.data.calendar.GoogleCalendarSyncManager
 import com.example.callscheduler.data.local.datastore.AiSettingsDataStore
@@ -54,6 +55,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         val settingsDataStore = AiSettingsDataStore(this)
+        val cloudDiagnosticEngine = CloudGeminiEngine(settingsDataStore)
         val dao = AppDatabase.getInstance(this).dao()
         val calendarManager = GoogleCalendarSyncManager(this)
 
@@ -68,6 +70,8 @@ class MainActivity : ComponentActivity() {
 
                 var apiKeyInput by remember(apiKey) { mutableStateOf(apiKey) }
                 var customDirInput by remember(customCallDir) { mutableStateOf(customCallDir) }
+                var apiDiagnosticReport by remember { mutableStateOf<String?>(null) }
+                var isDiagnosingApi by remember { mutableStateOf(false) }
                 var customTestText by remember {
                     mutableStateOf("김대리님, 모레 오전 10시 반에 판교역 스타벅스에서 프로젝트 미팅 진행하시죠. 요청하신 견적서 자료도 검토해서 오늘 저녁에 다시 연락드리겠습니다.")
                 }
@@ -133,7 +137,8 @@ class MainActivity : ComponentActivity() {
                                     context = this@MainActivity,
                                     filePath = copiedFile.absolutePath,
                                     existingRecordId = null,
-                                    overrideMode = null
+                                    overrideMode = null,
+                                    forceCloudOnly = false
                                 )
                                 Toast.makeText(
                                     this@MainActivity,
@@ -151,9 +156,9 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v2.8)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v2.9)", style = MaterialTheme.typography.titleLarge)
                                 Text(
-                                    "Gemini API 실패 시 온디바이스 즉시 자동 전환 + 통화별 [다시 분석 시도] 지원",
+                                    "Gemini API 실패 원인 상세 표시 + [Gemini API로 재시도] 전용 버튼 및 실시간 연결 진단",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -345,19 +350,52 @@ class MainActivity : ComponentActivity() {
                                         OutlinedTextField(
                                             value = apiKeyInput,
                                             onValueChange = { apiKeyInput = it },
-                                            label = { Text("Gemini API Key (실패 시 자동으로 온디바이스로 전환됨)") },
+                                            label = { Text("Gemini API Key (실패 시 원인 표시 및 온디바이스 자동전환)") },
                                             modifier = Modifier.fillMaxWidth(),
                                             singleLine = true
                                         )
-                                        Button(
-                                            onClick = {
-                                                scope.launch {
-                                                    settingsDataStore.setGeminiApiKey(apiKeyInput)
-                                                    Toast.makeText(this@MainActivity, "API 키가 저장 및 자동 백업되었습니다.", Toast.LENGTH_SHORT).show()
-                                                }
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Button(
+                                                onClick = {
+                                                    scope.launch {
+                                                        settingsDataStore.setGeminiApiKey(apiKeyInput)
+                                                        Toast.makeText(this@MainActivity, "API 키가 저장 및 자동 백업되었습니다.", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                },
+                                                modifier = Modifier.weight(1f)
+                                            ) {
+                                                Text("API 키 저장")
                                             }
-                                        ) {
-                                            Text("API 키 저장")
+                                            FilledTonalButton(
+                                                onClick = {
+                                                    scope.launch {
+                                                        settingsDataStore.setGeminiApiKey(apiKeyInput)
+                                                        isDiagnosingApi = true
+                                                        apiDiagnosticReport = "Gemini API 서버 및 활성 모델 연결 상태를 확인하는 중입니다..."
+                                                        val res = cloudDiagnosticEngine.diagnoseApiConnection(apiKeyInput)
+                                                        apiDiagnosticReport = res.getOrElse { "❌ 진단 중 예외 발생: ${it.message}" }
+                                                        isDiagnosingApi = false
+                                                    }
+                                                },
+                                                enabled = !isDiagnosingApi,
+                                                modifier = Modifier.weight(1f)
+                                            ) {
+                                                Text(if (isDiagnosingApi) "진단 중..." else "API 키 · 모델 연결 진단")
+                                            }
+                                        }
+
+                                        apiDiagnosticReport?.let { report ->
+                                            Surface(
+                                                tonalElevation = 2.dp,
+                                                shape = MaterialTheme.shapes.medium,
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text(
+                                                    text = report,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    modifier = Modifier.padding(12.dp)
+                                                )
+                                            }
                                         }
                                     }
 
@@ -478,7 +516,7 @@ class MainActivity : ComponentActivity() {
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
-                                            "5. 최근 통화 분석 로그 및 다시 분석 (${callRecords.size}건)",
+                                            "5. 최근 통화 분석 로그 및 API 재시도 (${callRecords.size}건)",
                                             style = MaterialTheme.typography.titleMedium
                                         )
                                         if (retryableRecords.isNotEmpty()) {
@@ -492,23 +530,24 @@ class MainActivity : ComponentActivity() {
                                                                 context = this@MainActivity,
                                                                 filePath = rec.filePath,
                                                                 existingRecordId = rec.id,
-                                                                overrideMode = null
+                                                                overrideMode = EngineMode.CLOUD_API,
+                                                                forceCloudOnly = true
                                                             )
                                                         }
                                                     }
                                                     Toast.makeText(
                                                         this@MainActivity,
-                                                        "실패·전환된 통화 녹음 ${count}건의 재분석을 시작했습니다.",
+                                                        "폴백·실패 항목 ${count}건을 Gemini API로 일괄 재시도합니다.",
                                                         Toast.LENGTH_SHORT
                                                     ).show()
                                                 }
                                             ) {
-                                                Text("실패 항목 일괄 재분석 (${retryableRecords.size}건)")
+                                                Text("Gemini API 일괄 재시도 (${retryableRecords.size}건)")
                                             }
                                         }
                                     }
                                     Text(
-                                        "Gemini API 장애 시 자동으로 온디바이스로 전환되며, 언제든 아래 버튼으로 다시 분석을 시도할 수 있습니다.",
+                                        "API 실패로 온디바이스로 자동 전환된 경우에도 실패 원인이 아래 로그에 함께 표시되며, [Gemini API로 재시도] 버튼으로 API만 단독 재호출할 수 있습니다.",
                                         style = MaterialTheme.typography.bodySmall
                                     )
                                 }
@@ -516,17 +555,18 @@ class MainActivity : ComponentActivity() {
                             items(callRecords) { rec ->
                                 CallRecordLogCard(
                                     record = rec,
-                                    onRetryAuto = {
+                                    onRetryGeminiApi = {
                                         if (File(rec.filePath).exists()) {
                                             enqueueReprocessCallRecord(
                                                 context = this@MainActivity,
                                                 filePath = rec.filePath,
                                                 existingRecordId = rec.id,
-                                                overrideMode = null
+                                                overrideMode = EngineMode.CLOUD_API,
+                                                forceCloudOnly = true
                                             )
                                             Toast.makeText(
                                                 this@MainActivity,
-                                                "${rec.contactName} 통화 녹음을 다시 분석합니다...",
+                                                "${rec.contactName} 통화 녹음을 Gemini API로 재시도합니다...",
                                                 Toast.LENGTH_SHORT
                                             ).show()
                                         } else {
@@ -543,11 +583,12 @@ class MainActivity : ComponentActivity() {
                                                 context = this@MainActivity,
                                                 filePath = rec.filePath,
                                                 existingRecordId = rec.id,
-                                                overrideMode = EngineMode.ON_DEVICE
+                                                overrideMode = EngineMode.ON_DEVICE,
+                                                forceCloudOnly = false
                                             )
                                             Toast.makeText(
                                                 this@MainActivity,
-                                                "${rec.contactName} 통화 녹음을 온디바이스 엔진으로 즉시 분석합니다...",
+                                                "${rec.contactName} 통화 녹음을 온디바이스 엔진으로 재분석합니다...",
                                                 Toast.LENGTH_SHORT
                                             ).show()
                                         } else {
@@ -571,11 +612,13 @@ class MainActivity : ComponentActivity() {
         context: Context,
         filePath: String,
         existingRecordId: Long?,
-        overrideMode: EngineMode?
+        overrideMode: EngineMode?,
+        forceCloudOnly: Boolean
     ) {
         val builder = Data.Builder()
             .putString("KEY_FILE_PATH", filePath)
             .putBoolean("KEY_FORCE_REPROCESS", true)
+            .putBoolean("KEY_FORCE_CLOUD_ONLY", forceCloudOnly)
         if (existingRecordId != null && existingRecordId > 0L) {
             builder.putLong("KEY_EXISTING_RECORD_ID", existingRecordId)
         }
@@ -678,7 +721,7 @@ fun ActionItemCard(
 @Composable
 fun CallRecordLogCard(
     record: CallRecordEntity,
-    onRetryAuto: () -> Unit,
+    onRetryGeminiApi: () -> Unit,
     onRetryOnDevice: () -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.KOREA) }
@@ -699,16 +742,16 @@ fun CallRecordLogCard(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Button(
-                    onClick = onRetryAuto,
+                    onClick = onRetryGeminiApi,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("다시 분석 시도")
+                    Text("Gemini API로 재시도")
                 }
                 OutlinedButton(
                     onClick = onRetryOnDevice,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("온디바이스로 분석")
+                    Text("온디바이스로 재분석")
                 }
             }
         }

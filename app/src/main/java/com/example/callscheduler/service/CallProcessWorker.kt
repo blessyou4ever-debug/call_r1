@@ -14,8 +14,11 @@ import com.example.callscheduler.data.local.db.AppDatabase
 import com.example.callscheduler.data.local.db.CallRecordEntity
 import com.example.callscheduler.data.parser.CallFilenameParser
 import java.io.File
+import java.text.SimpleDateFormat
 import java.time.LocalDateTime
 import java.time.ZoneId
+import java.util.Date
+import java.util.Locale
 
 class CallProcessWorker(
     appContext: Context,
@@ -26,6 +29,7 @@ class CallProcessWorker(
         val filePath = inputData.getString("KEY_FILE_PATH") ?: return Result.failure()
         val simulatedTranscript = inputData.getString("KEY_SIMULATED_TRANSCRIPT")
         val forceReprocess = inputData.getBoolean("KEY_FORCE_REPROCESS", false)
+        val forceCloudOnly = inputData.getBoolean("KEY_FORCE_CLOUD_ONLY", false)
         val existingRecordId = inputData.getLong("KEY_EXISTING_RECORD_ID", -1L).takeIf { it > 0L }
         val overrideModeName = inputData.getString("KEY_OVERRIDE_MODE")
         val overrideMode = overrideModeName?.let { runCatching { EngineMode.valueOf(it) }.getOrNull() }
@@ -51,19 +55,28 @@ class CallProcessWorker(
 
         val processOutcome = runCatching {
             if (!simulatedTranscript.isNullOrBlank()) {
-                val effectiveMode = overrideMode ?: settings.getCurrentMode()
+                val effectiveMode = if (forceCloudOnly) EngineMode.CLOUD_API else (overrideMode ?: settings.getCurrentMode())
                 val useCloud = effectiveMode != EngineMode.ON_DEVICE &&
                     settings.getCurrentApiKey().isNotBlank()
                 val actions = if (useCloud) {
-                    cloudEngine.extractActions(metadata, simulatedTranscript)
-                        .recoverCatching { onDeviceExtractor.extractActions(metadata, simulatedTranscript).getOrThrow() }
-                        .getOrDefault(emptyList())
+                    if (forceCloudOnly) {
+                        cloudEngine.extractActions(metadata, simulatedTranscript).getOrThrow()
+                    } else {
+                        cloudEngine.extractActions(metadata, simulatedTranscript)
+                            .recoverCatching { onDeviceExtractor.extractActions(metadata, simulatedTranscript).getOrThrow() }
+                            .getOrDefault(emptyList())
+                    }
                 } else {
                     onDeviceExtractor.extractActions(metadata, simulatedTranscript).getOrDefault(emptyList())
                 }
                 Triple(simulatedTranscript, if (useCloud) "CLOUD_GEMINI_TEXT" else "ON_DEVICE_NLP", actions)
             } else {
-                processor.process(targetFile, metadata, overrideMode).getOrThrow()
+                processor.process(
+                    audioFile = targetFile,
+                    metadata = metadata,
+                    overrideMode = overrideMode,
+                    forceCloudOnly = forceCloudOnly
+                ).getOrThrow()
             }
         }
 
@@ -72,6 +85,31 @@ class CallProcessWorker(
 
         if (processOutcome.isFailure) {
             val errorMsg = processOutcome.exceptionOrNull()?.message ?: "알 수 없는 분석 오류"
+            val nowTimeStr = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date())
+
+            // 사용자가 [Gemini API로 재시도]를 눌렀는데 실패한 경우:
+            // 기존에 온디바이스로 추출해 둔 원문과 일정(PENDING)을 지우지 않고 그대로 보존하면서 상단에 API 실패 원인만 명확히 갱신합니다.
+            val existingRecord = existingRecordId?.let { dao.getCallRecordById(it) }
+            if (forceCloudOnly && existingRecord != null && !existingRecord.engineUsed.startsWith("ERROR")) {
+                val baseText = existingRecord.transcript
+                    .substringBefore("\n\n⚠️ [Gemini API")
+                    .substringBefore("\n\n❌ [Gemini API 재시도 실패")
+                    .trim()
+                val updatedTranscript = "${baseText}\n\n" +
+                    "❌ [Gemini API 재시도 실패 (${nowTimeStr})]\n" +
+                    "• ${errorMsg}\n" +
+                    "(기존 온디바이스 분석 원문 및 추출된 일정은 그대로 유지됩니다.)"
+                dao.upsertCallRecord(
+                    existingId = existingRecord.id,
+                    record = existingRecord.copy(
+                        transcript = updatedTranscript,
+                        engineUsed = "ON_DEVICE_FALLBACK (API 재시도 실패)"
+                    ),
+                    clearPendingActionsOnUpdate = false
+                )
+                return Result.failure()
+            }
+
             dao.upsertCallRecord(
                 existingId = existingRecordId,
                 record = CallRecordEntity(
@@ -79,9 +117,10 @@ class CallProcessWorker(
                     contactName = metadata.contactName,
                     phoneNumber = metadata.phoneNumber,
                     callTimestampEpochMillis = callEpochMillis,
-                    transcript = "[분석 실패] ${errorMsg}\n(아래 [다시 분석 시도] 또는 [온디바이스로 분석] 버튼을 눌러 즉시 재시도할 수 있습니다.)",
-                    engineUsed = "ERROR"
-                )
+                    transcript = "[분석 실패 (${nowTimeStr})]\n${errorMsg}\n(아래 [Gemini API로 재시도] 또는 [온디바이스로 재분석] 버튼을 눌러 다시 시도할 수 있습니다.)",
+                    engineUsed = "ERROR (분석 실패)"
+                ),
+                clearPendingActionsOnUpdate = false
             )
             return Result.failure()
         }
@@ -97,7 +136,8 @@ class CallProcessWorker(
                 callTimestampEpochMillis = callEpochMillis,
                 transcript = transcript,
                 engineUsed = engineUsed
-            )
+            ),
+            clearPendingActionsOnUpdate = true
         )
 
         val notificationHelper = ConfirmationNotificationHelper(applicationContext)

@@ -102,7 +102,7 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
             }
 
             throw IllegalStateException(
-                "단말기 내장 음성 인식기가 오디오 변환을 완료하지 못했습니다. 잠시 후 [다시 분석 시도] 버튼을 눌러 재시도해 주세요."
+                "단말기 내장 음성 인식기가 오디오 변환을 완료하지 못했습니다. 잠시 후 [온디바이스로 재분석] 또는 [Gemini API로 재시도] 버튼을 눌러 주세요."
             )
         }
     }
@@ -583,7 +583,6 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
 class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : SttEngine, ScheduleExtractor {
 
     companion object {
-        // 오디오 멀티모달 입력이 활성화된 정식 Flash 모델들을 최우선 배치하고, TTS/Image 전용 모델은 철저히 배제
         private val CANDIDATE_MODELS = listOf(
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
@@ -603,6 +602,72 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         return unsupportedKeywords.none { lower.contains(it) }
     }
 
+    /**
+     * 사용자가 설정 화면에서 [API 키 · 모델 연결 진단] 버튼을 눌렀을 때
+     * 실제 Google 서버에 모델 목록 조회 및 경량 테스트 호출을 수행하여 정확한 상태나 오류 원인을 반환합니다.
+     */
+    suspend fun diagnoseApiConnection(apiKeyOverride: String? = null): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val apiKey = (apiKeyOverride ?: settingsDataStore.getCurrentApiKey()).trim()
+            if (apiKey.isBlank()) {
+                return@runCatching "❌ Gemini API 키가 비어 있습니다. 먼저 API 키를 입력하고 저장해 주세요."
+            }
+
+            val listUrl = URL("https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}")
+            val listConn = (listUrl.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 12_000
+                readTimeout = 12_000
+            }
+            val listCode = listConn.responseCode
+            if (listCode !in 200..299) {
+                val errRaw = runCatching { listConn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
+                val cleanErr = extractCleanGoogleErrorMessage(errRaw)
+                return@runCatching "❌ API 키 인증 또는 모델 목록 조회 실패 (HTTP ${listCode})\n• 원인: ${cleanErr}"
+            }
+
+            val body = listConn.inputStream.bufferedReader().use { it.readText() }
+            val modelsJson = JSONObject(body).optJSONArray("models") ?: JSONArray()
+            val audioModels = mutableListOf<String>()
+            for (i in 0 until modelsJson.length()) {
+                val m = modelsJson.getJSONObject(i)
+                val name = m.optString("name", "").removePrefix("models/")
+                val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
+                if (isAudioCapableModelName(name) && methods.contains("generateContent")) {
+                    audioModels.add(name)
+                }
+            }
+
+            val primaryModel = audioModels.firstOrNull { it == "gemini-2.5-flash" }
+                ?: audioModels.firstOrNull()
+                ?: "gemini-2.5-flash"
+
+            val testPayload = JSONObject().apply {
+                put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject().put(
+                            "parts",
+                            JSONArray().put(JSONObject().put("text", "연결 테스트입니다. OK 라고만 답하세요."))
+                        )
+                    )
+                )
+            }.toString()
+
+            return@runCatching try {
+                val reply = callSingleModel(apiKey, primaryModel, testPayload).trim()
+                "✅ Gemini API 정상 연결 확인!\n" +
+                    "• 대표 활성 모델: ${primaryModel}\n" +
+                    "• 테스트 응답: ${reply.take(40)}\n" +
+                    "• 계정의 오디오 지원 Flash 모델(${audioModels.size}개): ${audioModels.take(5).joinToString(", ")}"
+            } catch (e: Exception) {
+                "⚠️ 모델 목록 조회는 성공했으나 실제 생성 호출에서 오류가 발생했습니다.\n" +
+                    "• 시도 모델: ${primaryModel}\n" +
+                    "• 상세 오류: ${e.message}"
+            }
+        }
+    }
+
     override suspend fun transcribe(audioOrPcmFile: File): Result<SttResult> = withContext(Dispatchers.IO) {
         runCatching {
             val apiKey = settingsDataStore.getCurrentApiKey()
@@ -615,32 +680,31 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             val audioBytes = audioOrPcmFile.readBytes()
             val base64Audio = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
 
-            val parts = JSONArray().apply {
-                put(
-                    JSONObject().put(
-                        "inline_data",
-                        JSONObject()
-                            .put("mime_type", mimeType)
-                            .put("data", base64Audio)
-                    )
-                )
-                put(
-                    JSONObject().put(
-                        "text",
-                        "이 통화 녹음 오디오를 한국어로 빠짐없이 받아쓰기(STT)한 뒤 JSON 객체 {\"transcript\": \"전체 통화 내용\"} 형식으로만 응답하세요."
-                    )
-                )
+            val firstAttempt = runCatching {
+                requestAudioTranscription(apiKey, mimeType, base64Audio, useJsonMimeConfig = true)
             }
 
-            val requestJson = JSONObject().apply {
-                put("contents", JSONArray().put(JSONObject().put("parts", parts)))
-                put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
-            }.toString()
+            val responseText = if (firstAttempt.isSuccess) {
+                firstAttempt.getOrThrow()
+            } else {
+                val firstErr = firstAttempt.exceptionOrNull()
+                val errMsg = firstErr?.message ?: ""
+                // 만약 .m4u / 특이 오디오 포맷 거부(HTTP 400) 또는 JSON MIME 충돌이면 표준 WAV(audio/wav)로 디코딩하여 재시도
+                if (errMsg.contains("HTTP 400") || errMsg.contains("INVALID_ARGUMENT") || errMsg.contains("format")) {
+                    val wavAttempt = AudioPcmDecoder.transcodeToWavBytes(audioOrPcmFile)
+                    if (wavAttempt.isSuccess) {
+                        val wavBase64 = Base64.encodeToString(wavAttempt.getOrThrow(), Base64.NO_WRAP)
+                        requestAudioTranscription(apiKey, "audio/wav", wavBase64, useJsonMimeConfig = false)
+                    } else {
+                        requestAudioTranscription(apiKey, mimeType, base64Audio, useJsonMimeConfig = false)
+                    }
+                } else {
+                    throw firstErr ?: IllegalStateException("Gemini 오디오 STT 호출 실패")
+                }
+            }
 
-            val responseText = postGeminiJsonWithFallback(apiKey, requestJson)
             val parsedTranscript = unwrapTranscriptJson(responseText)
-
-            require(parsedTranscript.isNotBlank()) { "오디오에서 음성을 추출하지 못했습니다." }
+            require(parsedTranscript.isNotBlank()) { "Gemini API가 빈 텍스트를 반환했습니다." }
 
             SttResult(
                 transcript = parsedTranscript,
@@ -648,6 +712,39 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 engineName = "CLOUD_GEMINI_AUDIO"
             )
         }
+    }
+
+    private suspend fun requestAudioTranscription(
+        apiKey: String,
+        mimeType: String,
+        base64Audio: String,
+        useJsonMimeConfig: Boolean
+    ): String {
+        val parts = JSONArray().apply {
+            put(
+                JSONObject().put(
+                    "inline_data",
+                    JSONObject()
+                        .put("mime_type", mimeType)
+                        .put("data", base64Audio)
+                )
+            )
+            put(
+                JSONObject().put(
+                    "text",
+                    "이 통화 녹음 오디오를 한국어로 빠짐없이 받아쓰기(STT)한 뒤 JSON 객체 {\"transcript\": \"전체 통화 내용\"} 형식으로만 응답하세요."
+                )
+            )
+        }
+
+        val requestJson = JSONObject().apply {
+            put("contents", JSONArray().put(JSONObject().put("parts", parts)))
+            if (useJsonMimeConfig) {
+                put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+            }
+        }.toString()
+
+        return postGeminiJsonWithFallback(apiKey, requestJson)
     }
 
     private fun unwrapTranscriptJson(raw: String): String {
@@ -701,47 +798,84 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
     }
 
     private suspend fun postGeminiJsonWithFallback(apiKey: String, requestJson: String): String {
-        val modelsToTry = LinkedHashSet<String>(CANDIDATE_MODELS)
-        var lastError: Exception? = null
+        // 1단계: 현재 API 키로 사용 가능한 실제 Flash 모델 목록을 먼저 빠르게 조회하여 폐기된 모델(404) 호출을 방지
+        val discovered = discoverAvailableFlashModels(apiKey)
+        val orderedModels = LinkedHashSet<String>()
+        if (discovered.isNotEmpty()) {
+            // 검증된 정식 모델을 우선 배치
+            CANDIDATE_MODELS.filter { it in discovered }.forEach { orderedModels.add(it) }
+            discovered.forEach { orderedModels.add(it) }
+        } else {
+            orderedModels.addAll(CANDIDATE_MODELS)
+        }
 
-        for (modelName in modelsToTry.toList()) {
+        var primaryError: Exception? = null
+        val errorTraces = mutableListOf<String>()
+
+        for (modelName in orderedModels.toList()) {
             try {
                 return callSingleModel(apiKey, modelName, requestJson)
             } catch (e: GeminiRetryableHttpException) {
-                lastError = e
+                if (primaryError == null || e.statusCode != 404) {
+                    primaryError = e
+                }
+                errorTraces.add("${modelName}(HTTP ${e.statusCode}: ${e.cleanReason.take(90)})")
+
+                // 401/403 API 키 자체 오류는 다른 모델을 찔러도 동일하므로 즉시 중단하여 빠른 에러 리포트 제공
+                if (e.statusCode == 401 || e.statusCode == 403 || e.cleanReason.contains("API_KEY_INVALID")) {
+                    break
+                }
+
                 if (e.statusCode == 404) {
                     val suggested = SUGGESTED_MODEL_REGEX.findAll(e.errorBody)
                         .map { it.groupValues[1] }
                         .firstOrNull { it != modelName && isAudioCapableModelName(it) }
-                    if (suggested != null && !modelsToTry.contains(suggested)) {
+                    if (suggested != null && !orderedModels.contains(suggested)) {
                         try {
                             return callSingleModel(apiKey, suggested, requestJson)
+                        } catch (inner: GeminiRetryableHttpException) {
+                            errorTraces.add("${suggested}(HTTP ${inner.statusCode}: ${inner.cleanReason.take(80)})")
                         } catch (inner: Exception) {
-                            lastError = inner
+                            errorTraces.add("${suggested}(${inner.message?.take(80)})")
                         }
                     }
                 }
-                delay(300L)
+                delay(250L)
             } catch (e: Exception) {
-                lastError = e
+                if (primaryError == null) primaryError = e
+                errorTraces.add("${modelName}(${e.message?.take(90)})")
             }
         }
 
-        val discoveredList = discoverAvailableFlashModels(apiKey)
-        for (discovered in discoveredList) {
-            if (discovered in modelsToTry) continue
-            try {
-                return callSingleModel(apiKey, discovered, requestJson)
-            } catch (e: Exception) {
-                lastError = e
-            }
+        val traceSummary = if (errorTraces.isNotEmpty()) {
+            errorTraces.take(4).joinToString(" / ")
+        } else {
+            primaryError?.message ?: "알 수 없는 네트워크 또는 API 오류"
         }
-
-        throw lastError ?: IllegalStateException("사용 가능한 Gemini 모델을 찾을 수 없습니다.")
+        throw IllegalStateException("Gemini API 호출 실패 — ${traceSummary}")
     }
 
-    private class GeminiRetryableHttpException(val statusCode: Int, modelName: String, val errorBody: String) :
-        IllegalStateException("Gemini API HTTP ${statusCode} (${modelName}): ${errorBody.take(240)}")
+    private fun extractCleanGoogleErrorMessage(rawErrorBody: String): String {
+        if (rawErrorBody.isBlank()) return "응답 본문 없음"
+        return runCatching {
+            val errObj = JSONObject(rawErrorBody).optJSONObject("error")
+            if (errObj != null) {
+                val status = errObj.optString("status", "")
+                val msg = errObj.optString("message", rawErrorBody)
+                if (status.isNotBlank()) "[${status}] ${msg}" else msg
+            } else {
+                rawErrorBody.replace(Regex("\\s+"), " ").take(200)
+            }
+        }.getOrDefault(rawErrorBody.replace(Regex("\\s+"), " ").take(200))
+    }
+
+    private inner class GeminiRetryableHttpException(
+        val statusCode: Int,
+        val modelName: String,
+        val errorBody: String
+    ) : IllegalStateException("HTTP ${statusCode} (${modelName}): ${extractCleanGoogleErrorMessage(errorBody)}") {
+        val cleanReason: String = extractCleanGoogleErrorMessage(errorBody)
+    }
 
     private fun callSingleModel(apiKey: String, modelName: String, requestJson: String): String {
         val cleanModel = modelName.removePrefix("models/")
@@ -759,32 +893,48 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         }
 
         val responseCode = conn.responseCode
-        // HTTP 400 (예: 특정 모델에서 Audio input modality 미지원)도 다른 멀티모달 모델로 즉시 폴백하도록 포함
-        if (responseCode in listOf(400, 404, 408, 429, 500, 502, 503, 504)) {
-            val errBody = runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
-            throw GeminiRetryableHttpException(responseCode, cleanModel, errBody)
-        }
         if (responseCode !in 200..299) {
             val errBody = runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
-            throw IllegalStateException("Gemini API HTTP ${responseCode} (${cleanModel}): ${errBody.take(240)}")
+            throw GeminiRetryableHttpException(responseCode, cleanModel, errBody)
         }
         val responseStr = conn.inputStream.bufferedReader().use { it.readText() }
 
         val root = JSONObject(responseStr)
-        return root.getJSONArray("candidates")
-            .getJSONObject(0)
-            .getJSONObject("content")
-            .getJSONArray("parts")
-            .getJSONObject(0)
-            .getString("text")
+        val candidates = root.optJSONArray("candidates")
+            ?: throw IllegalStateException("응답에 candidates가 없습니다 (${cleanModel}): ${responseStr.take(160)}")
+        if (candidates.length() == 0) {
+            val blockReason = root.optJSONObject("promptFeedback")?.optString("blockReason", "UNKNOWN")
+            throw IllegalStateException("응답이 차단되었거나 비어 있습니다 (사유: ${blockReason})")
+        }
+
+        val parts = candidates.getJSONObject(0)
+            .optJSONObject("content")
+            ?.optJSONArray("parts")
+            ?: throw IllegalStateException("응답에 content.parts가 없습니다 (${cleanModel})")
+
+        // Gemini 2.5 / 3.x 모델의 Thinking 파트("thought": true)를 건너뛰고 실제 텍스트 파트만 추출
+        var fallbackText = ""
+        for (i in 0 until parts.length()) {
+            val partObj = parts.optJSONObject(i) ?: continue
+            val text = partObj.optString("text", "")
+            val isThought = partObj.optBoolean("thought", false)
+            if (text.isNotBlank()) {
+                if (!isThought) {
+                    return text
+                }
+                fallbackText = text
+            }
+        }
+        if (fallbackText.isNotBlank()) return fallbackText
+        throw IllegalStateException("모델(${cleanModel}) 응답 파트에서 텍스트를 찾을 수 없습니다.")
     }
 
     private fun discoverAvailableFlashModels(apiKey: String): List<String> = runCatching {
         val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 12_000
-            readTimeout = 12_000
+            connectTimeout = 10_000
+            readTimeout = 10_000
         }
         if (conn.responseCode !in 200..299) return@runCatching emptyList()
         val body = conn.inputStream.bufferedReader().use { it.readText() }
@@ -794,7 +944,6 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             val m = models.getJSONObject(i)
             val name = m.optString("name", "").removePrefix("models/")
             val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
-            // tts, image 등 오디오 입력이 불가능한 특수 모델은 자동 탐색에서 완전 제외
             if (isAudioCapableModelName(name) && methods.contains("generateContent")) {
                 found.add(name)
             }
@@ -861,79 +1010,102 @@ class HybridCallAiProcessor(
     private val onDeviceExtractor: ScheduleExtractor,
     private val cloudEngine: CloudGeminiEngine
 ) {
-    companion object {
-        private const val MIN_CONFIDENCE_THRESHOLD = 0.68f
-    }
-
     /**
-     * Gemini API 접속이 실패하더라도 에러로 멈추지 않고 즉시 온디바이스(On-Device) 엔진으로 자동 전환하여
-     * 음성 인식 및 요약·일정 추출을 수행합니다.
+     * 1) forceCloudOnly == true ([Gemini API로 재시도] 버튼 클릭 시):
+     *    온디바이스로 넘어가지 않고 오직 Gemini API로만 분석을 시도하며, 실패 시 정확한 Gemini API 오류를 그대로 반환합니다.
+     * 2) 일반 자동 실행 시:
+     *    Gemini API가 실패하면 즉시 온디바이스로 자동 전환하되, 왜 API가 실패했는지 상세 오류 로그(cloudSttErrorDetail)를
+     *    결과 원문 하단에 반드시 함께 기록하여 사용자가 원인을 투명하게 확인할 수 있게 합니다.
      */
     suspend fun process(
         audioFile: File,
         metadata: CallMetadata,
-        overrideMode: EngineMode? = null
+        overrideMode: EngineMode? = null,
+        forceCloudOnly: Boolean = false
     ): Result<Triple<String, String, List<ExtractedActionDto>>> {
-        val mode = overrideMode ?: settingsDataStore.getCurrentMode()
+        val mode = if (forceCloudOnly) EngineMode.CLOUD_API else (overrideMode ?: settingsDataStore.getCurrentMode())
         val hasApiKey = settingsDataStore.getCurrentApiKey().isNotBlank()
 
         return runCatching {
+            if (forceCloudOnly) {
+                require(hasApiKey) { "Gemini API 키가 입력되지 않았습니다. [3. AI 음성 인식 모드]에서 API 키를 먼저 저장해 주세요." }
+                val cloudStt = cloudEngine.transcribe(audioFile).getOrThrow()
+                val cloudActions = cloudEngine.extractActions(metadata, cloudStt.transcript).recoverCatching {
+                    onDeviceExtractor.extractActions(metadata, cloudStt.transcript).getOrThrow()
+                }.getOrThrow()
+                return@runCatching Triple(cloudStt.transcript, "CLOUD_GEMINI_AUDIO (API 재시도 성공)", cloudActions)
+            }
+
             var switchedFromCloudError = false
+            var cloudErrorDiagnostic: String? = null
+
             var sttResult = when (mode) {
                 EngineMode.ON_DEVICE -> {
-                    onDeviceStt.transcribe(audioFile).recoverCatching { localErr ->
-                        if (hasApiKey) cloudEngine.transcribe(audioFile).getOrThrow() else throw localErr
-                    }.getOrThrow()
+                    onDeviceStt.transcribe(audioFile).getOrThrow()
                 }
-                EngineMode.CLOUD_API -> {
+                EngineMode.CLOUD_API, EngineMode.AUTO_FALLBACK -> {
                     if (hasApiKey) {
-                        cloudEngine.transcribe(audioFile).recoverCatching {
-                            switchedFromCloudError = true
-                            // Gemini API 실패 시 즉시 온디바이스 STT로 자동 전환 (최대 2회 시도)
-                            onDeviceStt.transcribe(audioFile).recoverCatching {
-                                delay(400L)
-                                onDeviceStt.transcribe(audioFile).getOrThrow()
-                            }.getOrThrow()
-                        }.getOrThrow()
-                    } else {
-                        onDeviceStt.transcribe(audioFile).getOrThrow()
-                    }
-                }
-                EngineMode.AUTO_FALLBACK -> {
-                    if (hasApiKey) {
-                        // 하이브리드 모드: 먼저 Gemini API를 시도하거나 온디바이스와 상호 보완
                         val cloudAttempt = cloudEngine.transcribe(audioFile)
                         if (cloudAttempt.isSuccess) {
                             cloudAttempt.getOrThrow()
                         } else {
                             switchedFromCloudError = true
-                            onDeviceStt.transcribe(audioFile).recoverCatching {
+                            cloudErrorDiagnostic = cloudAttempt.exceptionOrNull()?.message ?: "알 수 없는 Gemini API 오류"
+                            // 온디바이스로 자동 전환 시도 (최대 2회) & 만약 온디바이스도 실패하면 1차 API 오류와 2차 온디바이스 오류를 모두 표시!
+                            val localAttempt = onDeviceStt.transcribe(audioFile).recoverCatching {
                                 delay(400L)
                                 onDeviceStt.transcribe(audioFile).getOrThrow()
-                            }.getOrThrow()
+                            }
+                            if (localAttempt.isSuccess) {
+                                localAttempt.getOrThrow()
+                            } else {
+                                val localErrMsg = localAttempt.exceptionOrNull()?.message ?: "온디바이스 음성 인식 실패"
+                                throw IllegalStateException(
+                                    "❌ [1차 Gemini API 실패 원인]\n• ${cloudErrorDiagnostic}\n\n" +
+                                        "❌ [2차 온디바이스 자동전환 실패 원인]\n• ${localErrMsg}"
+                                )
+                            }
                         }
                     } else {
+                        if (mode == EngineMode.CLOUD_API) {
+                            switchedFromCloudError = true
+                            cloudErrorDiagnostic = "Gemini API 키가 설정되지 않아 온디바이스로 전환되었습니다."
+                        }
                         onDeviceStt.transcribe(audioFile).getOrThrow()
                     }
                 }
             }
 
-            if (switchedFromCloudError && sttResult.engineName == "ANDROID_ON_DEVICE_STT") {
-                sttResult = sttResult.copy(engineName = "ON_DEVICE_FALLBACK (API 실패 자동전환)")
-            }
+            val cleanTranscriptForExtraction = sttResult.transcript
 
             val actions = when {
                 mode == EngineMode.ON_DEVICE || switchedFromCloudError || !hasApiKey -> {
-                    onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
+                    onDeviceExtractor.extractActions(metadata, cleanTranscriptForExtraction).getOrThrow()
                 }
                 else -> {
-                    cloudEngine.extractActions(metadata, sttResult.transcript).recoverCatching {
-                        onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
+                    cloudEngine.extractActions(metadata, cleanTranscriptForExtraction).recoverCatching { extractErr ->
+                        cloudErrorDiagnostic = "STT는 성공했으나 일정 추출 API 호출 실패: ${extractErr.message}"
+                        onDeviceExtractor.extractActions(metadata, cleanTranscriptForExtraction).getOrThrow()
                     }.getOrThrow()
                 }
             }
 
-            Triple(sttResult.transcript, sttResult.engineName, actions)
+            val finalEngineLabel = if (switchedFromCloudError) {
+                "ON_DEVICE_FALLBACK (API 실패 자동전환)"
+            } else {
+                sttResult.engineName
+            }
+
+            val finalDisplayTranscript = if (!cloudErrorDiagnostic.isNullOrBlank()) {
+                "${cleanTranscriptForExtraction}\n\n" +
+                    "⚠️ [Gemini API 실패 원인 (온디바이스 자동전환됨)]\n" +
+                    "• ${cloudErrorDiagnostic}\n" +
+                    "👉 아래 [Gemini API로 재시도] 버튼을 누르면 API로 다시 분석합니다."
+            } else {
+                cleanTranscriptForExtraction
+            }
+
+            Triple(finalDisplayTranscript, finalEngineLabel, actions)
         }
     }
 }

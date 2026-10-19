@@ -62,6 +62,16 @@ class CallSchedulerDao(private val dbHelper: AppDatabase) {
         }
     }
 
+    suspend fun getCallRecordById(id: Long): CallRecordEntity? = withContext(Dispatchers.IO) {
+        val db = dbHelper.readableDatabase
+        db.rawQuery(
+            "SELECT * FROM call_records WHERE id = ? LIMIT 1",
+            arrayOf(id.toString())
+        ).use { cursor ->
+            if (cursor.moveToFirst()) readRecordCursorRow(cursor) else null
+        }
+    }
+
     suspend fun findRecordIdByFilePath(filePath: String): Long? = withContext(Dispatchers.IO) {
         val db = dbHelper.readableDatabase
         db.rawQuery(
@@ -72,7 +82,11 @@ class CallSchedulerDao(private val dbHelper: AppDatabase) {
         }
     }
 
-    suspend fun upsertCallRecord(existingId: Long?, record: CallRecordEntity): Long = withContext(Dispatchers.IO) {
+    suspend fun upsertCallRecord(
+        existingId: Long?,
+        record: CallRecordEntity,
+        clearPendingActionsOnUpdate: Boolean = true
+    ): Long = withContext(Dispatchers.IO) {
         val db = dbHelper.writableDatabase
         val targetId = existingId?.takeIf { it > 0L } ?: findRecordIdByFilePath(record.filePath)
         val values = ContentValues().apply {
@@ -85,8 +99,9 @@ class CallSchedulerDao(private val dbHelper: AppDatabase) {
         }
         val finalId = if (targetId != null && targetId > 0L) {
             db.update("call_records", values, "id = ?", arrayOf(targetId.toString()))
-            // 재분석 시 이전에 추출된 미확정(PENDING) 일정은 정리하여 중복 생성을 방지
-            db.delete("action_items", "callRecordId = ? AND status = 'PENDING'", arrayOf(targetId.toString()))
+            if (clearPendingActionsOnUpdate) {
+                db.delete("action_items", "callRecordId = ? AND status = 'PENDING'", arrayOf(targetId.toString()))
+            }
             targetId
         } else {
             db.insert("call_records", null, values)

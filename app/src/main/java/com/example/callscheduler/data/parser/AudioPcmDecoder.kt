@@ -6,6 +6,8 @@ import android.media.MediaFormat
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.abs
 
 data class DecodedPcmInfo(
@@ -87,6 +89,50 @@ object AudioPcmDecoder {
     }
 
     /**
+     * .m4u / 특이 컨테이너 오디오가 Gemini API에서 MIME/포맷 오류(HTTP 400)를 일으킬 때
+     * 모든 Gemini 모델이 100% 표준 지원하는 16-bit PCM WAV 바이트 배열(audio/wav)로 즉시 변환합니다.
+     */
+    fun transcodeToWavBytes(inputAudioFile: File): Result<ByteArray> = runCatching {
+        val tempPcm = File.createTempFile("gemini_wav_", ".pcm")
+        try {
+            val decoded = decodeToPcmInfo(inputAudioFile, tempPcm).getOrThrow()
+            val pcmBytes = decoded.pcmFile.readBytes()
+            require(pcmBytes.isNotEmpty()) { "디코딩된 PCM 데이터가 비어 있습니다." }
+
+            val channels = decoded.channelCount.coerceIn(1, 2)
+            val sampleRate = decoded.sampleRate.coerceIn(8000, 48000)
+            val bitsPerSample = 16
+            val byteRate = sampleRate * channels * (bitsPerSample / 8)
+            val blockAlign = channels * (bitsPerSample / 8)
+            val dataSize = pcmBytes.size
+            val totalChunkSize = 36 + dataSize
+
+            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
+                put("RIFF".toByteArray(Charsets.US_ASCII))
+                putInt(totalChunkSize)
+                put("WAVE".toByteArray(Charsets.US_ASCII))
+                put("fmt ".toByteArray(Charsets.US_ASCII))
+                putInt(16) // Subchunk1Size for PCM
+                putShort(1.toShort()) // AudioFormat 1 = PCM
+                putShort(channels.toShort())
+                putInt(sampleRate)
+                putInt(byteRate)
+                putShort(blockAlign.toShort())
+                putShort(bitsPerSample.toShort())
+                put("data".toByteArray(Charsets.US_ASCII))
+                putInt(dataSize)
+            }.array()
+
+            val out = ByteArray(44 + dataSize)
+            System.arraycopy(header, 0, out, 0, 44)
+            System.arraycopy(pcmBytes, 0, out, 44, dataSize)
+            out
+        } finally {
+            runCatching { tempPcm.delete() }
+        }
+    }
+
+    /**
      * 통화 중 침묵(Pause) 때문에 Android SpeechRecognizer가 첫 마디("어 남편 음")만 인식하고
      * 끊어버리는 현상을 막기 위해, 긴 무음 구간을 제거하고 8초 단위의 연속 청크 파일들로 분할합니다.
      */
@@ -99,7 +145,6 @@ object AudioPcmDecoder {
         if (rawBytes.isEmpty()) return emptyList()
 
         val frameBytes = (decoded.channelCount * 2).coerceAtLeast(2)
-        // 50ms 단위 프레임 크기
         val windowFrames = (decoded.sampleRate / 20).coerceAtLeast(160)
         val windowBytes = windowFrames * frameBytes
 
@@ -122,7 +167,6 @@ object AudioPcmDecoder {
             val avgAmp = if (samples > 0) (sumAbs / samples) else 0L
             if (avgAmp < 180L) {
                 consecutiveSilentWindows++
-                // 200ms(4윈도우) 이하의 짧은 숨고르기만 유지하고 그 이상 긴 침묵은 잘라내어 VAD 조기 종료 방지
                 if (consecutiveSilentWindows <= 4) {
                     activeAudioOut.write(rawBytes, offset, windowBytes)
                 }
