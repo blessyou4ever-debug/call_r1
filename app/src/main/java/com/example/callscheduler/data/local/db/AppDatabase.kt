@@ -54,13 +54,27 @@ class CallSchedulerDao(private val dbHelper: AppDatabase) {
 
     suspend fun hasProcessedFile(filePath: String): Boolean = withContext(Dispatchers.IO) {
         val db = dbHelper.readableDatabase
-        db.rawQuery("SELECT id FROM call_records WHERE filePath = ? LIMIT 1", arrayOf(filePath)).use {
+        db.rawQuery(
+            "SELECT id FROM call_records WHERE filePath = ? AND engineUsed NOT LIKE 'ERROR%' LIMIT 1",
+            arrayOf(filePath)
+        ).use {
             it.moveToFirst()
         }
     }
 
-    suspend fun insertCallRecord(record: CallRecordEntity): Long = withContext(Dispatchers.IO) {
+    suspend fun findRecordIdByFilePath(filePath: String): Long? = withContext(Dispatchers.IO) {
+        val db = dbHelper.readableDatabase
+        db.rawQuery(
+            "SELECT id FROM call_records WHERE filePath = ? ORDER BY id DESC LIMIT 1",
+            arrayOf(filePath)
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getLong(0) else null
+        }
+    }
+
+    suspend fun upsertCallRecord(existingId: Long?, record: CallRecordEntity): Long = withContext(Dispatchers.IO) {
         val db = dbHelper.writableDatabase
+        val targetId = existingId?.takeIf { it > 0L } ?: findRecordIdByFilePath(record.filePath)
         val values = ContentValues().apply {
             put("filePath", record.filePath)
             put("contactName", record.contactName)
@@ -69,10 +83,19 @@ class CallSchedulerDao(private val dbHelper: AppDatabase) {
             put("transcript", record.transcript)
             put("engineUsed", record.engineUsed)
         }
-        val id = db.insert("call_records", null, values)
+        val finalId = if (targetId != null && targetId > 0L) {
+            db.update("call_records", values, "id = ?", arrayOf(targetId.toString()))
+            // 재분석 시 이전에 추출된 미확정(PENDING) 일정은 정리하여 중복 생성을 방지
+            db.delete("action_items", "callRecordId = ? AND status = 'PENDING'", arrayOf(targetId.toString()))
+            targetId
+        } else {
+            db.insert("call_records", null, values)
+        }
         refreshFlowSync()
-        id
+        finalId
     }
+
+    suspend fun insertCallRecord(record: CallRecordEntity): Long = upsertCallRecord(null, record)
 
     suspend fun insertActionItem(item: ActionItemEntity): Long = withContext(Dispatchers.IO) {
         val db = dbHelper.writableDatabase

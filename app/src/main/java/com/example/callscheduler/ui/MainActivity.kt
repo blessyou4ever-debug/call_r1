@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import com.example.callscheduler.data.calendar.CalendarSyncResult
@@ -89,7 +90,6 @@ class MainActivity : ComponentActivity() {
                     Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
                 }
 
-                // 폴더 탐색기로 통화 녹음 경로 직접 선택 (SAF OpenDocumentTree -> 실제 파일 경로 변환)
                 val folderPickerLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.OpenDocumentTree()
                 ) { treeUri: Uri? ->
@@ -108,7 +108,7 @@ class MainActivity : ComponentActivity() {
                                 reloadMonitoringDirectories(this@MainActivity)
                                 Toast.makeText(
                                     this@MainActivity,
-                                    "통화 녹음 폴더가 설정되었습니다: $resolvedPath",
+                                    "통화 녹음 폴더가 설정되었습니다: ${resolvedPath}",
                                     Toast.LENGTH_LONG
                                 ).show()
                             }
@@ -129,14 +129,11 @@ class MainActivity : ComponentActivity() {
                         scope.launch {
                             val copiedFile = copyUriToCacheFile(this@MainActivity, uri)
                             if (copiedFile != null) {
-                                val input = Data.Builder()
-                                    .putString("KEY_FILE_PATH", copiedFile.absolutePath)
-                                    .putBoolean("KEY_FORCE_REPROCESS", true)
-                                    .build()
-                                WorkManager.getInstance(this@MainActivity).enqueue(
-                                    OneTimeWorkRequestBuilder<CallProcessWorker>()
-                                        .setInputData(input)
-                                        .build()
+                                enqueueReprocessCallRecord(
+                                    context = this@MainActivity,
+                                    filePath = copiedFile.absolutePath,
+                                    existingRecordId = null,
+                                    overrideMode = null
                                 )
                                 Toast.makeText(
                                     this@MainActivity,
@@ -154,9 +151,9 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v2.7)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v2.8)", style = MaterialTheme.typography.titleLarge)
                                 Text(
-                                    "삼성 기본전화 · SKT T전화/에이닷 파일명 완벽 호환 + 사용자 폴더 경로 설정",
+                                    "Gemini API 실패 시 온디바이스 즉시 자동 전환 + 통화별 [다시 분석 시도] 지원",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -237,7 +234,6 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                        // 2. 통화 녹음 폴더 경로 설정 카드 (T전화 / 삼성 기본전화 / 폴더 탐색기)
                         item {
                             Card(modifier = Modifier.fillMaxWidth()) {
                                 Column(
@@ -249,7 +245,7 @@ class MainActivity : ComponentActivity() {
                                         "현재: 통합 자동 감시 (삼성 Recordings/Call + T전화 TPhoneCallRecords 모두 감시)"
                                     } else {
                                         val exists = File(customCallDir).exists()
-                                        "현재 지정 경로: $customCallDir (${if (exists) "폴더 확인됨" else "폴더 생성 시 자동 감시"})"
+                                        "현재 지정 경로: ${customCallDir} (${if (exists) "폴더 확인됨" else "폴더 생성 시 자동 감시"})"
                                     }
                                     Text(statusDesc, style = MaterialTheme.typography.bodySmall)
 
@@ -349,7 +345,7 @@ class MainActivity : ComponentActivity() {
                                         OutlinedTextField(
                                             value = apiKeyInput,
                                             onValueChange = { apiKeyInput = it },
-                                            label = { Text("Gemini API Key (실제 오디오 STT 및 정밀 추출용)") },
+                                            label = { Text("Gemini API Key (실패 시 자동으로 온디바이스로 전환됨)") },
                                             modifier = Modifier.fillMaxWidth(),
                                             singleLine = true
                                         )
@@ -472,16 +468,128 @@ class MainActivity : ComponentActivity() {
 
                         if (callRecords.isNotEmpty()) {
                             item {
-                                Text("5. 최근 통화 분석 로그 및 STT 원문 (${callRecords.size}건)", style = MaterialTheme.typography.titleMedium)
+                                val retryableRecords = callRecords.filter {
+                                    it.engineUsed.startsWith("ERROR") || it.engineUsed.contains("FALLBACK")
+                                }
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "5. 최근 통화 분석 로그 및 다시 분석 (${callRecords.size}건)",
+                                            style = MaterialTheme.typography.titleMedium
+                                        )
+                                        if (retryableRecords.isNotEmpty()) {
+                                            FilledTonalButton(
+                                                onClick = {
+                                                    var count = 0
+                                                    retryableRecords.forEach { rec ->
+                                                        if (File(rec.filePath).exists()) {
+                                                            count++
+                                                            enqueueReprocessCallRecord(
+                                                                context = this@MainActivity,
+                                                                filePath = rec.filePath,
+                                                                existingRecordId = rec.id,
+                                                                overrideMode = null
+                                                            )
+                                                        }
+                                                    }
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "실패·전환된 통화 녹음 ${count}건의 재분석을 시작했습니다.",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                }
+                                            ) {
+                                                Text("실패 항목 일괄 재분석 (${retryableRecords.size}건)")
+                                            }
+                                        }
+                                    }
+                                    Text(
+                                        "Gemini API 장애 시 자동으로 온디바이스로 전환되며, 언제든 아래 버튼으로 다시 분석을 시도할 수 있습니다.",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
                             }
                             items(callRecords) { rec ->
-                                CallRecordLogCard(rec)
+                                CallRecordLogCard(
+                                    record = rec,
+                                    onRetryAuto = {
+                                        if (File(rec.filePath).exists()) {
+                                            enqueueReprocessCallRecord(
+                                                context = this@MainActivity,
+                                                filePath = rec.filePath,
+                                                existingRecordId = rec.id,
+                                                overrideMode = null
+                                            )
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                "${rec.contactName} 통화 녹음을 다시 분석합니다...",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        } else {
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                "원본 녹음 파일을 찾을 수 없습니다: ${rec.filePath}",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    },
+                                    onRetryOnDevice = {
+                                        if (File(rec.filePath).exists()) {
+                                            enqueueReprocessCallRecord(
+                                                context = this@MainActivity,
+                                                filePath = rec.filePath,
+                                                existingRecordId = rec.id,
+                                                overrideMode = EngineMode.ON_DEVICE
+                                            )
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                "${rec.contactName} 통화 녹음을 온디바이스 엔진으로 즉시 분석합니다...",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        } else {
+                                            Toast.makeText(
+                                                this@MainActivity,
+                                                "원본 녹음 파일을 찾을 수 없습니다: ${rec.filePath}",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
+                                )
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    private fun enqueueReprocessCallRecord(
+        context: Context,
+        filePath: String,
+        existingRecordId: Long?,
+        overrideMode: EngineMode?
+    ) {
+        val builder = Data.Builder()
+            .putString("KEY_FILE_PATH", filePath)
+            .putBoolean("KEY_FORCE_REPROCESS", true)
+        if (existingRecordId != null && existingRecordId > 0L) {
+            builder.putLong("KEY_EXISTING_RECORD_ID", existingRecordId)
+        }
+        if (overrideMode != null) {
+            builder.putString("KEY_OVERRIDE_MODE", overrideMode.name)
+        }
+        val req = OneTimeWorkRequestBuilder<CallProcessWorker>()
+            .setInputData(builder.build())
+            .build()
+        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+            "reanalyze_${filePath.hashCode()}",
+            ExistingWorkPolicy.REPLACE,
+            req
+        )
     }
 
     private fun reloadMonitoringDirectories(context: Context) {
@@ -494,23 +602,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * SAF OpenDocumentTree URI (예: content://com.android.externalstorage.documents/tree/primary%3ARecordings%2FTPhoneCallRecords)
-     * 를 실제 파일시스템 경로(/storage/emulated/0/Recordings/TPhoneCallRecords)로 변환합니다.
-     */
     private fun resolveTreeUriToFilePath(treeUri: Uri): String? = runCatching {
         val docId = DocumentsContract.getTreeDocumentId(treeUri) ?: return@runCatching null
         val decoded = URLDecoder.decode(docId, "UTF-8")
         when {
             decoded.startsWith("primary:") -> {
                 val subPath = decoded.removePrefix("primary:").trim('/')
-                if (subPath.isEmpty()) "/storage/emulated/0" else "/storage/emulated/0/$subPath"
+                if (subPath.isEmpty()) "/storage/emulated/0" else "/storage/emulated/0/${subPath}"
             }
             decoded.contains(":") -> {
                 val parts = decoded.split(":", limit = 2)
                 val volumeId = parts[0]
                 val subPath = parts.getOrElse(1) { "" }.trim('/')
-                if (subPath.isEmpty()) "/storage/$volumeId" else "/storage/$volumeId/$subPath"
+                if (subPath.isEmpty()) "/storage/${volumeId}" else "/storage/${volumeId}/${subPath}"
             }
             else -> "/storage/emulated/0/${decoded.trim('/')}"
         }
@@ -550,7 +654,7 @@ fun ActionItemCard(
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("[${item.actionType}] ${item.title}", style = MaterialTheme.typography.titleMedium)
             Text("통화 상대: ${item.contactName}", style = MaterialTheme.typography.bodySmall)
-            Text("예정 시각: $timeText | 장소: ${item.location ?: "없음"}", style = MaterialTheme.typography.bodySmall)
+            Text("예정 시각: ${timeText} | 장소: ${item.location ?: "없음"}", style = MaterialTheme.typography.bodySmall)
             Text(item.description, style = MaterialTheme.typography.bodyMedium)
             Text("상태: ${item.status}", style = MaterialTheme.typography.labelMedium)
 
@@ -572,10 +676,14 @@ fun ActionItemCard(
 }
 
 @Composable
-fun CallRecordLogCard(record: CallRecordEntity) {
+fun CallRecordLogCard(
+    record: CallRecordEntity,
+    onRetryAuto: () -> Unit,
+    onRetryOnDevice: () -> Unit
+) {
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.KOREA) }
     Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(
                 "${record.contactName} · 엔진: ${record.engineUsed}",
                 style = MaterialTheme.typography.labelLarge
@@ -585,6 +693,24 @@ fun CallRecordLogCard(record: CallRecordEntity) {
                 style = MaterialTheme.typography.bodySmall
             )
             Text(record.transcript, style = MaterialTheme.typography.bodySmall)
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onRetryAuto,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("다시 분석 시도")
+                }
+                OutlinedButton(
+                    onClick = onRetryOnDevice,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("온디바이스로 분석")
+                }
+            }
         }
     }
 }

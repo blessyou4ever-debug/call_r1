@@ -102,7 +102,7 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
             }
 
             throw IllegalStateException(
-                "단말기 내장 음성 인식기가 오디오 변환을 완료하지 못했습니다. Gemini API 키를 설정하면 끊김 없는 전체 통화 인식이 가능합니다."
+                "단말기 내장 음성 인식기가 오디오 변환을 완료하지 못했습니다. 잠시 후 [다시 분석 시도] 버튼을 눌러 재시도해 주세요."
             )
         }
     }
@@ -336,15 +336,15 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         return when {
             hasFathersDay && hasKindergarten && hasPickup -> "아빠의 날 유치원 하원"
             hasFathersDay && hasKindergarten && hasDropoff -> "아빠의 날 유치원 등원"
-            hasFathersDay -> "아빠의 날 행사${if (!location.isNullOrBlank()) " ($location)" else ""}"
-            hasMothersDay -> "엄마의 날 행사${if (!location.isNullOrBlank()) " ($location)" else ""}"
+            hasFathersDay -> "아빠의 날 행사${if (!location.isNullOrBlank()) " (${location})" else ""}"
+            hasMothersDay -> "엄마의 날 행사${if (!location.isNullOrBlank()) " (${location})" else ""}"
             transcript.contains("유치원") && hasPickup -> "유치원 하원"
             transcript.contains("어린이집") && hasPickup -> "어린이집 하원"
             transcript.contains("유치원") && hasDropoff -> "유치원 등원"
             transcript.contains("병원") || transcript.contains("치과") || transcript.contains("검진") -> "${location ?: "병원"} 방문 예약"
-            transcript.contains("미팅") || transcript.contains("회의") -> "${contactName}님과 미팅${if (!location.isNullOrBlank()) " ($location)" else ""}"
+            transcript.contains("미팅") || transcript.contains("회의") -> "${contactName}님과 미팅${if (!location.isNullOrBlank()) " (${location})" else ""}"
             transcript.contains("식사") || transcript.contains("점심") || transcript.contains("저녁") -> "${contactName}님과 식사 약속"
-            !location.isNullOrBlank() -> "${contactName}님과 일정 ($location)"
+            !location.isNullOrBlank() -> "${contactName}님과 일정 (${location})"
             else -> "${contactName}님과 약속 일정"
         }
     }
@@ -583,16 +583,24 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
 class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : SttEngine, ScheduleExtractor {
 
     companion object {
+        // 오디오 멀티모달 입력이 활성화된 정식 Flash 모델들을 최우선 배치하고, TTS/Image 전용 모델은 철저히 배제
         private val CANDIDATE_MODELS = listOf(
-            "gemini-3.5-flash-lite",
-            "gemini-3.6-flash",
-            "gemini-3.8-flash",
-            "gemini-3.5-flash",
-            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
             "gemini-3-flash-preview",
-            "gemini-2.5-flash"
+            "gemini-3.1-flash-lite-preview"
         )
         private val SUGGESTED_MODEL_REGEX = Regex("""models/([a-zA-Z0-9._-]+)""")
+    }
+
+    private fun isAudioCapableModelName(name: String): Boolean {
+        val lower = name.lowercase()
+        if (!lower.contains("gemini") || !lower.contains("flash")) return false
+        val unsupportedKeywords = listOf("tts", "image", "vision", "embedding", "aqa", "bisect", "thinking")
+        return unsupportedKeywords.none { lower.contains(it) }
     }
 
     override suspend fun transcribe(audioOrPcmFile: File): Result<SttResult> = withContext(Dispatchers.IO) {
@@ -704,7 +712,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                 if (e.statusCode == 404) {
                     val suggested = SUGGESTED_MODEL_REGEX.findAll(e.errorBody)
                         .map { it.groupValues[1] }
-                        .firstOrNull { it != modelName }
+                        .firstOrNull { it != modelName && isAudioCapableModelName(it) }
                     if (suggested != null && !modelsToTry.contains(suggested)) {
                         try {
                             return callSingleModel(apiKey, suggested, requestJson)
@@ -713,7 +721,7 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
                         }
                     }
                 }
-                delay(400L)
+                delay(300L)
             } catch (e: Exception) {
                 lastError = e
             }
@@ -733,15 +741,15 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
     }
 
     private class GeminiRetryableHttpException(val statusCode: Int, modelName: String, val errorBody: String) :
-        IllegalStateException("Gemini API HTTP $statusCode ($modelName): ${errorBody.take(240)}")
+        IllegalStateException("Gemini API HTTP ${statusCode} (${modelName}): ${errorBody.take(240)}")
 
     private fun callSingleModel(apiKey: String, modelName: String, requestJson: String): String {
         val cleanModel = modelName.removePrefix("models/")
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=$apiKey")
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${apiKey}")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 25_000
-            readTimeout = 60_000
+            connectTimeout = 20_000
+            readTimeout = 45_000
             doOutput = true
             setRequestProperty("Content-Type", "application/json; charset=UTF-8")
         }
@@ -751,13 +759,14 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
         }
 
         val responseCode = conn.responseCode
-        if (responseCode in listOf(404, 429, 500, 502, 503, 504)) {
+        // HTTP 400 (예: 특정 모델에서 Audio input modality 미지원)도 다른 멀티모달 모델로 즉시 폴백하도록 포함
+        if (responseCode in listOf(400, 404, 408, 429, 500, 502, 503, 504)) {
             val errBody = runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
             throw GeminiRetryableHttpException(responseCode, cleanModel, errBody)
         }
         if (responseCode !in 200..299) {
             val errBody = runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull() ?: ""
-            throw IllegalStateException("Gemini API HTTP $responseCode ($cleanModel): ${errBody.take(240)}")
+            throw IllegalStateException("Gemini API HTTP ${responseCode} (${cleanModel}): ${errBody.take(240)}")
         }
         val responseStr = conn.inputStream.bufferedReader().use { it.readText() }
 
@@ -771,11 +780,11 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
     }
 
     private fun discoverAvailableFlashModels(apiKey: String): List<String> = runCatching {
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=$apiKey")
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 15_000
-            readTimeout = 15_000
+            connectTimeout = 12_000
+            readTimeout = 12_000
         }
         if (conn.responseCode !in 200..299) return@runCatching emptyList()
         val body = conn.inputStream.bufferedReader().use { it.readText() }
@@ -785,7 +794,8 @@ class CloudGeminiEngine(private val settingsDataStore: AiSettingsDataStore) : St
             val m = models.getJSONObject(i)
             val name = m.optString("name", "").removePrefix("models/")
             val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
-            if (name.contains("gemini") && name.contains("flash") && methods.contains("generateContent") && !name.contains("2.5")) {
+            // tts, image 등 오디오 입력이 불가능한 특수 모델은 자동 탐색에서 완전 제외
+            if (isAudioCapableModelName(name) && methods.contains("generateContent")) {
                 found.add(name)
             }
         }
@@ -842,7 +852,7 @@ JSON 배열 스키마로만 응답하세요:
 [{"actionType":"APPOINTMENT|TODO|CALLBACK","title":"제목","description":"요약","startDateTimeIso":"2026-10-19T15:00:00","endDateTimeIso":"2026-10-19T16:00:00","location":"장소"}]
 
 [통화 텍스트]
-$transcript
+${transcript}
 """.trimIndent()
 
 class HybridCallAiProcessor(
@@ -855,56 +865,71 @@ class HybridCallAiProcessor(
         private const val MIN_CONFIDENCE_THRESHOLD = 0.68f
     }
 
-    suspend fun process(audioFile: File, metadata: CallMetadata): Result<Triple<String, String, List<ExtractedActionDto>>> {
-        val mode = settingsDataStore.getCurrentMode()
+    /**
+     * Gemini API 접속이 실패하더라도 에러로 멈추지 않고 즉시 온디바이스(On-Device) 엔진으로 자동 전환하여
+     * 음성 인식 및 요약·일정 추출을 수행합니다.
+     */
+    suspend fun process(
+        audioFile: File,
+        metadata: CallMetadata,
+        overrideMode: EngineMode? = null
+    ): Result<Triple<String, String, List<ExtractedActionDto>>> {
+        val mode = overrideMode ?: settingsDataStore.getCurrentMode()
         val hasApiKey = settingsDataStore.getCurrentApiKey().isNotBlank()
 
         return runCatching {
+            var switchedFromCloudError = false
             var sttResult = when (mode) {
                 EngineMode.ON_DEVICE -> {
                     onDeviceStt.transcribe(audioFile).recoverCatching { localErr ->
                         if (hasApiKey) cloudEngine.transcribe(audioFile).getOrThrow() else throw localErr
                     }.getOrThrow()
                 }
-                EngineMode.CLOUD_API -> cloudEngine.transcribe(audioFile).recoverCatching { cloudErr ->
-                    onDeviceStt.transcribe(audioFile).getOrElse { throw cloudErr }
-                }.getOrThrow()
-                EngineMode.AUTO_FALLBACK -> {
-                    val local = onDeviceStt.transcribe(audioFile).getOrNull()
-                    if (local != null && local.confidence >= MIN_CONFIDENCE_THRESHOLD) {
-                        local
-                    } else if (hasApiKey) {
-                        cloudEngine.transcribe(audioFile).getOrElse { local ?: throw it }
-                    } else {
-                        local ?: throw IllegalStateException("온디바이스 음성 인식 결과가 너무 짧고 API 키가 설정되지 않았습니다.")
-                    }
-                }
-            }
-
-            var actions = when (mode) {
-                EngineMode.ON_DEVICE -> onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
-                EngineMode.CLOUD_API, EngineMode.AUTO_FALLBACK -> {
+                EngineMode.CLOUD_API -> {
                     if (hasApiKey) {
-                        cloudEngine.extractActions(metadata, sttResult.transcript).recoverCatching {
-                            onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
+                        cloudEngine.transcribe(audioFile).recoverCatching {
+                            switchedFromCloudError = true
+                            // Gemini API 실패 시 즉시 온디바이스 STT로 자동 전환 (최대 2회 시도)
+                            onDeviceStt.transcribe(audioFile).recoverCatching {
+                                delay(400L)
+                                onDeviceStt.transcribe(audioFile).getOrThrow()
+                            }.getOrThrow()
                         }.getOrThrow()
                     } else {
-                        onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
+                        onDeviceStt.transcribe(audioFile).getOrThrow()
+                    }
+                }
+                EngineMode.AUTO_FALLBACK -> {
+                    if (hasApiKey) {
+                        // 하이브리드 모드: 먼저 Gemini API를 시도하거나 온디바이스와 상호 보완
+                        val cloudAttempt = cloudEngine.transcribe(audioFile)
+                        if (cloudAttempt.isSuccess) {
+                            cloudAttempt.getOrThrow()
+                        } else {
+                            switchedFromCloudError = true
+                            onDeviceStt.transcribe(audioFile).recoverCatching {
+                                delay(400L)
+                                onDeviceStt.transcribe(audioFile).getOrThrow()
+                            }.getOrThrow()
+                        }
+                    } else {
+                        onDeviceStt.transcribe(audioFile).getOrThrow()
                     }
                 }
             }
 
-            if (actions.isEmpty() && sttResult.engineName == "ANDROID_ON_DEVICE_STT" && sttResult.transcript.length < 25 && hasApiKey) {
-                val rescuedStt = cloudEngine.transcribe(audioFile).getOrNull()
-                if (rescuedStt != null && rescuedStt.transcript.length > sttResult.transcript.length) {
-                    sttResult = rescuedStt
-                    actions = if (mode == EngineMode.ON_DEVICE) {
-                        onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrDefault(emptyList())
-                    } else {
-                        cloudEngine.extractActions(metadata, sttResult.transcript)
-                            .recoverCatching { onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow() }
-                            .getOrDefault(emptyList())
-                    }
+            if (switchedFromCloudError && sttResult.engineName == "ANDROID_ON_DEVICE_STT") {
+                sttResult = sttResult.copy(engineName = "ON_DEVICE_FALLBACK (API 실패 자동전환)")
+            }
+
+            val actions = when {
+                mode == EngineMode.ON_DEVICE || switchedFromCloudError || !hasApiKey -> {
+                    onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
+                }
+                else -> {
+                    cloudEngine.extractActions(metadata, sttResult.transcript).recoverCatching {
+                        onDeviceExtractor.extractActions(metadata, sttResult.transcript).getOrThrow()
+                    }.getOrThrow()
                 }
             }
 

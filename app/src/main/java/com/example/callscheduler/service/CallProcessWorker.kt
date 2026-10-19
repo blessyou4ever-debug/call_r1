@@ -26,6 +26,9 @@ class CallProcessWorker(
         val filePath = inputData.getString("KEY_FILE_PATH") ?: return Result.failure()
         val simulatedTranscript = inputData.getString("KEY_SIMULATED_TRANSCRIPT")
         val forceReprocess = inputData.getBoolean("KEY_FORCE_REPROCESS", false)
+        val existingRecordId = inputData.getLong("KEY_EXISTING_RECORD_ID", -1L).takeIf { it > 0L }
+        val overrideModeName = inputData.getString("KEY_OVERRIDE_MODE")
+        val overrideMode = overrideModeName?.let { runCatching { EngineMode.valueOf(it) }.getOrNull() }
         val targetFile = File(filePath)
 
         val db = AppDatabase.getInstance(applicationContext)
@@ -48,7 +51,8 @@ class CallProcessWorker(
 
         val processOutcome = runCatching {
             if (!simulatedTranscript.isNullOrBlank()) {
-                val useCloud = settings.getCurrentMode() != EngineMode.ON_DEVICE &&
+                val effectiveMode = overrideMode ?: settings.getCurrentMode()
+                val useCloud = effectiveMode != EngineMode.ON_DEVICE &&
                     settings.getCurrentApiKey().isNotBlank()
                 val actions = if (useCloud) {
                     cloudEngine.extractActions(metadata, simulatedTranscript)
@@ -59,19 +63,23 @@ class CallProcessWorker(
                 }
                 Triple(simulatedTranscript, if (useCloud) "CLOUD_GEMINI_TEXT" else "ON_DEVICE_NLP", actions)
             } else {
-                processor.process(targetFile, metadata).getOrThrow()
+                processor.process(targetFile, metadata, overrideMode).getOrThrow()
             }
         }
 
+        val callEpochMillis = metadata.callDateTime
+            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
         if (processOutcome.isFailure) {
             val errorMsg = processOutcome.exceptionOrNull()?.message ?: "알 수 없는 분석 오류"
-            dao.insertCallRecord(
-                CallRecordEntity(
+            dao.upsertCallRecord(
+                existingId = existingRecordId,
+                record = CallRecordEntity(
                     filePath = metadata.filePath,
                     contactName = metadata.contactName,
                     phoneNumber = metadata.phoneNumber,
-                    callTimestampEpochMillis = System.currentTimeMillis(),
-                    transcript = "[분석 실패] $errorMsg",
+                    callTimestampEpochMillis = callEpochMillis,
+                    transcript = "[분석 실패] ${errorMsg}\n(아래 [다시 분석 시도] 또는 [온디바이스로 분석] 버튼을 눌러 즉시 재시도할 수 있습니다.)",
                     engineUsed = "ERROR"
                 )
             )
@@ -80,13 +88,13 @@ class CallProcessWorker(
 
         val (transcript, engineUsed, extractedDtos) = processOutcome.getOrThrow()
 
-        val callRecordId = dao.insertCallRecord(
-            CallRecordEntity(
+        val callRecordId = dao.upsertCallRecord(
+            existingId = existingRecordId,
+            record = CallRecordEntity(
                 filePath = metadata.filePath,
                 contactName = metadata.contactName,
                 phoneNumber = metadata.phoneNumber,
-                callTimestampEpochMillis = metadata.callDateTime
-                    .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli(),
+                callTimestampEpochMillis = callEpochMillis,
                 transcript = transcript,
                 engineUsed = engineUsed
             )
