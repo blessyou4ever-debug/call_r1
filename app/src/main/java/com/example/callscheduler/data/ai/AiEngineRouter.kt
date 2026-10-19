@@ -358,8 +358,8 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
     ): String {
         val dateTimeLabel = formatKoreanFriendlyDateTime(start)
         val coreTopic = extractCleanedCoreTopic(transcript, title)
-        val locPart = if (!location.isNullOrBlank() && !coreTopic.contains(location)) " $location에서" else ""
-        return "${contactName}님과 통화 중 $dateTimeLabel$locPart $coreTopic 일정 확인"
+        val locPart = if (!location.isNullOrBlank() && !coreTopic.contains(location)) " ${location}에서" else ""
+        return "${contactName}님과 통화 중 ${dateTimeLabel}${locPart} ${coreTopic} 일정 확인"
             .replace(multiSpaceRegex, " ")
             .trim()
     }
@@ -371,7 +371,7 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
     ): String {
         val dateTimeLabel = formatKoreanFriendlyDateTime(callbackTime)
         val coreTopic = extractCleanedCoreTopic(transcript, "논의 사항")
-        return "${contactName}님과 통화 중 $dateTimeLabel $coreTopic 관련 다시 연락하기로 확인"
+        return "${contactName}님과 통화 중 ${dateTimeLabel} ${coreTopic} 관련 다시 연락하기로 확인"
             .replace(multiSpaceRegex, " ")
             .trim()
     }
@@ -381,7 +381,7 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
         transcript: String
     ): String {
         val coreTopic = extractCleanedCoreTopic(transcript, "요청 사항")
-        return "${contactName}님과 통화 중 $coreTopic 처리 및 확인 필요"
+        return "${contactName}님과 통화 중 ${coreTopic} 처리 및 확인 필요"
             .replace(multiSpaceRegex, " ")
             .trim()
     }
@@ -394,7 +394,7 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
             else -> dt.hour
         }
         val minPart = if (dt.minute > 0) " ${dt.minute}분" else ""
-        return "${dt.monthValue}월 ${dt.dayOfMonth}일 $meridiem ${displayHour}시$minPart"
+        return "${dt.monthValue}월 ${dt.dayOfMonth}일 ${meridiem} ${displayHour}시${minPart}"
     }
 
     private fun extractCleanedCoreTopic(transcript: String, fallbackTitle: String): String {
