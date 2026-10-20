@@ -302,7 +302,7 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
     private val dayOnlyRegex = Regex("""(?:^|\s)(\d{1,2})\s*일(?:이|에|날|\s|$)""")
     private val timeRegex = Regex("""(오전|오후|아침|점심|저녁|밤)?\s*(\d{1,2})\s*시(?:\s*(\d{1,2})\s*분|\s*(반))?""")
 
-    private val relativeDateCleanRegex = Regex("""(?:이번\s*주|다음\s*주|내일모레|모레|내일|오늘)(?:에|에는|은|는)?\s*(?:[월화수목금토일]요일(?:에)?)?""")
+    private val relativeDateCleanRegex = Regex("""(?:이번\s*주말|주말|이번\s*주|다음\s*주|내일모레|모레|글피|내일|오늘|이따가|이따)(?:에|에는|은|는)?\s*(?:[월화수목금토일]요일(?:에)?)?|[월화수목금토일]요일(?:에|에는|은|는)?""")
     private val monthDayCleanRegex = Regex("""\d{1,2}\s*월\s*\d{1,2}\s*일(?:이|에|날|은|는)?""")
     private val dayOnlyCleanRegex = Regex("""(?:^|\s)\d{1,2}\s*일(?:이|에|날|은|는)""")
     private val timeCleanRegex = Regex("""(?:오전|오후|아침|점심|저녁|밤)?\s*\d{1,2}\s*시(?:\s*\d{1,2}\s*분|\s*반)?(?:까지|에|쯤|부터)?""")
@@ -587,16 +587,26 @@ class OnDeviceLiteRtExtractor(private val context: Context) : ScheduleExtractor 
                 text.contains("글피") -> { date = date.plusDays(3); dateMatched = true }
                 text.contains("모레") || text.contains("내일모레") -> { date = date.plusDays(2); dateMatched = true }
                 text.contains("내일") -> { date = date.plusDays(1); dateMatched = true }
-                text.contains("오늘") -> { dateMatched = true }
+                text.contains("오늘") || text.contains("이따가") || text.contains("이따") -> { dateMatched = true }
                 text.contains("다음 주") || text.contains("다음주") -> {
                     val dow = parseDayOfWeek(text) ?: DayOfWeek.MONDAY
                     date = date.with(TemporalAdjusters.next(dow))
                     dateMatched = true
                 }
                 text.contains("이번 주") || text.contains("이번주") -> {
-                    val dow = parseDayOfWeek(text)
-                    if (dow != null) {
-                        date = date.with(TemporalAdjusters.nextOrSame(dow))
+                    val dow = parseDayOfWeek(text) ?: DayOfWeek.SATURDAY
+                    date = date.with(TemporalAdjusters.nextOrSame(dow))
+                    dateMatched = true
+                }
+                text.contains("주말") -> {
+                    date = date.with(TemporalAdjusters.nextOrSame(DayOfWeek.SATURDAY))
+                    dateMatched = true
+                }
+                else -> {
+                    // '이번 주' 없이 단독으로 '금요일 오후 3시', '수요일 11시'라고 말한 경우에도 다가오는 해당 요일로 정확히 매칭
+                    val standaloneDow = parseDayOfWeek(text)
+                    if (standaloneDow != null) {
+                        date = date.with(TemporalAdjusters.nextOrSame(standaloneDow))
                         dateMatched = true
                     }
                 }

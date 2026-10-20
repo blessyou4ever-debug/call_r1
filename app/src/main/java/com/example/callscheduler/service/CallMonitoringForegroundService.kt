@@ -31,9 +31,10 @@ class CallMonitoringForegroundService : Service() {
         private const val KEY_WATERMARK_MILLIS = "watermark_epoch_millis"
         private const val KEY_SEEN_PATHS = "seen_file_paths"
 
-        // 자동 감시에서는 현재 시각 기준 최대 3분(180초) 이내에 새로 생성/수정되었고,
-        // 감시 시작 시각(Watermark) 이후에 끝난 통화 녹음만 분석하여 과거 녹음이 자동 분석되는 현상을 원천 차단합니다.
-        private const val MAX_AUTO_DETECT_AGE_MILLIS = 3 * 60 * 1000L
+        // 장시간 통화(최대 20분)에서도 DATE_ADDED 기준 누락이 발생하지 않도록 20분 창을 허용하되,
+        // 감시 시작 시각(Watermark) 이전에 생성/수정된 과거 녹음은 100% 원천 차단합니다.
+        private const val MAX_AUTO_DETECT_AGE_MILLIS = 20 * 60 * 1000L
+        private const val MAX_SEEN_CACHE_SIZE = 500
 
         const val ACTION_RESET_BASELINE = "com.example.callscheduler.ACTION_RESET_BASELINE"
         const val ACTION_RELOAD_DIRS = "com.example.callscheduler.ACTION_RELOAD_DIRS"
@@ -46,19 +47,32 @@ class CallMonitoringForegroundService : Service() {
             return AiSettingsDataStore(context.applicationContext).getActiveMonitoredDirs()
         }
 
+        private fun trimSeenSetIfNeeded(seen: MutableSet<String>): MutableSet<String> {
+            if (seen.size <= MAX_SEEN_CACHE_SIZE) return seen
+            val excess = seen.size - MAX_SEEN_CACHE_SIZE
+            val trimmed = seen.drop(excess).toMutableSet()
+            return trimmed
+        }
+
         /**
-         * 감시 시작, 앱 실행, 권한 허용, 또는 폴더 변경 시 현재 존재하는 모든 기존 녹음 파일(폴더 + MediaStore + SAF)을
-         * 기준선(seen)에 등록하고 기준 시각(Watermark)을 현재 시각으로 설정하여 과거 통화 내역이 불러와지는 것을 완벽히 차단합니다.
+         * 최초 설치/권한 승인 또는 사용자가 명시적으로 기준선 리셋(폴더 변경·목록 비우기)을 요청했을 때만
+         * 현재 존재하는 모든 기존 녹음 파일(폴더 + MediaStore + SAF)을 seen에 등록하고 기준 시각(Watermark)을 설정합니다.
+         * 이미 감시 중인 상태에서 단순히 앱 화면을 열거나 서비스가 재시작될 때는 기존 Watermark를 유지하여,
+         * 통화 종료 직후 앱을 열었을 때 방금 끝난 새 녹음까지 과거 파일로 덮어써지는 현상을 완벽히 방지합니다!
          */
         fun initializeOrResetBaseline(context: Context, forceResetToNow: Boolean = false) {
             val appCtx = context.applicationContext
             val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val now = System.currentTimeMillis()
             val existingWatermark = prefs.getLong(KEY_WATERMARK_MILLIS, 0L)
-            val seen = (prefs.getStringSet(KEY_SEEN_PATHS, emptySet()) ?: emptySet()).toMutableSet()
+            val existingSeen = prefs.getStringSet(KEY_SEEN_PATHS, emptySet()) ?: emptySet()
 
-            // 권한 승인 전 빈 상태로 저장되었거나 강제 리셋 요청 시 기준 시각을 현재로 갱신
-            val shouldUpdateWatermark = forceResetToNow || existingWatermark == 0L || seen.isEmpty()
+            // 이미 기준 시각(existingWatermark > 0L)이 설정되어 있고 강제 리셋 요청이 아니라면 기존 기준선을 그대로 보존!
+            if (!forceResetToNow && existingWatermark > 0L && existingSeen.isNotEmpty()) {
+                return
+            }
+
+            val seen = existingSeen.toMutableSet()
 
             // 1) 감시 대상 폴더의 기존 파일들을 모두 seen에 등록
             for (dirPath in getMonitoredDirectories(appCtx)) {
@@ -90,7 +104,7 @@ class CallMonitoringForegroundService : Service() {
                     val dataIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
                     val nameIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME)
                     var count = 0
-                    while (cursor.moveToNext() && count < 100) {
+                    while (cursor.moveToNext() && count < 120) {
                         count++
                         val path = if (dataIdx >= 0) cursor.getString(dataIdx) else null
                         val name = if (nameIdx >= 0) cursor.getString(nameIdx) else ""
@@ -108,17 +122,18 @@ class CallMonitoringForegroundService : Service() {
             // 3) SAF Tree URI에 기존에 있던 파일들도 모두 seen 등록
             scanSafTreeUriFiles(appCtx, onlyRegisterBaseline = true, seenSet = seen)
 
-            val editor = prefs.edit().putStringSet(KEY_SEEN_PATHS, seen)
-            if (shouldUpdateWatermark) {
-                editor.putLong(KEY_WATERMARK_MILLIS, now)
-            }
-            editor.apply()
+            val boundedSeen = trimSeenSetIfNeeded(seen)
+            val newWatermark = if (forceResetToNow || existingWatermark == 0L) now else existingWatermark
+            prefs.edit()
+                .putStringSet(KEY_SEEN_PATHS, boundedSeen)
+                .putLong(KEY_WATERMARK_MILLIS, newWatermark)
+                .apply()
         }
 
         /**
          * 통화 종료 후 새로 생성된 녹음 파일인지 엄격히 검증합니다.
          * 1) 파일 수정 시각(lastModified)이 감시 시작 기준 시각(Watermark) 이전이면 과거 파일이므로 즉시 seen에 넣고 제외!
-         * 2) 파일 수정 시각이 현재 시각으로부터 3분(MAX_AUTO_DETECT_AGE_MILLIS)보다 오래되었으면 과거 파일이므로 즉시 제외!
+         * 2) 파일 수정 시각이 현재 시각으로부터 20분(MAX_AUTO_DETECT_AGE_MILLIS)보다 오래되었으면 과거 파일이므로 즉시 제외!
          * 3) 통화 중 파일 크기가 증가하는 동안에는 대기하고, 쓰기가 완료(안정화)된 직후에만 1회 분석합니다.
          */
         private fun isReadyNewCallRecordingFile(context: Context, file: File): Boolean {
@@ -135,7 +150,7 @@ class CallMonitoringForegroundService : Service() {
             val watermark = prefs.getLong(KEY_WATERMARK_MILLIS, now)
             val seen = prefs.getStringSet(KEY_SEEN_PATHS, emptySet()) ?: emptySet()
 
-            // 핵심 방어벽: 감시 시작 시각(watermark) 이전에 만들어진 파일이거나, 만들어진 지 3분이 넘은 과거 파일은 절대 자동 분석하지 않음!
+            // 핵심 방어벽: 감시 시작 시각(watermark) 이전에 만들어진 파일이거나, 오래된 과거 파일은 절대 자동 분석하지 않음!
             if (lastMod < watermark || (now - lastMod) > MAX_AUTO_DETECT_AGE_MILLIS) {
                 if (path !in seen) {
                     markFileAsSeen(appCtx, file, advanceWatermark = false)
@@ -176,7 +191,8 @@ class CallMonitoringForegroundService : Service() {
             val seen = (prefs.getStringSet(KEY_SEEN_PATHS, emptySet()) ?: emptySet()).toMutableSet()
             seen.add(file.absolutePath)
             analyzedFileSizes[file.absolutePath] = file.length()
-            val editor = prefs.edit().putStringSet(KEY_SEEN_PATHS, seen)
+            val boundedSeen = trimSeenSetIfNeeded(seen)
+            val editor = prefs.edit().putStringSet(KEY_SEEN_PATHS, boundedSeen)
             if (advanceWatermark) {
                 val currentWatermark = prefs.getLong(KEY_WATERMARK_MILLIS, System.currentTimeMillis())
                 editor.putLong(KEY_WATERMARK_MILLIS, maxOf(currentWatermark, file.lastModified()))
@@ -185,7 +201,7 @@ class CallMonitoringForegroundService : Service() {
         }
 
         /**
-         * 사용자가 메인 화면에서 [폴더 내 가장 최근 통화 녹음 1건 수동으로 찾아 분석하기] 버튼을 직접 눌렀을 때만
+         * 사용자가 메인 화면에서 [(수동 실행) 폴더 내 가장 최근 녹음 1건 지금 바로 분석하기] 버튼을 직접 눌렀을 때만
          * 과거 파일 여부를 무시하고 가장 최근 녹음 파일 1개를 찾아 즉시 분석합니다.
          */
         fun forceAnalyzeLatestRecordingInFolders(context: Context): String? {
@@ -279,21 +295,23 @@ class CallMonitoringForegroundService : Service() {
                         if (onlyRegisterBaseline) {
                             currentSeen.add(virtualKey)
                         } else if (lastMod < watermark || (now - lastMod) > MAX_AUTO_DETECT_AGE_MILLIS) {
-                            // 과거 SAF 파일은 seen에 등록만 하고 분석하지 않음
                             if (virtualKey !in currentSeen) {
                                 currentSeen.add(virtualKey)
-                                prefs.edit().putStringSet(KEY_SEEN_PATHS, currentSeen).apply()
+                                prefs.edit().putStringSet(KEY_SEEN_PATHS, trimSeenSetIfNeeded(currentSeen)).apply()
                             }
                         } else if (virtualKey !in currentSeen && (now - lastMod) >= 1500L) {
                             currentSeen.add(virtualKey)
                             prefs.edit()
-                                .putStringSet(KEY_SEEN_PATHS, currentSeen)
+                                .putStringSet(KEY_SEEN_PATHS, trimSeenSetIfNeeded(currentSeen))
                                 .putLong(KEY_WATERMARK_MILLIS, maxOf(watermark, lastMod))
                                 .apply()
                             val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
                             val targetFile = File(context.cacheDir, name)
                             context.contentResolver.openInputStream(docUri)?.use { input ->
                                 FileOutputStream(targetFile).use { output -> input.copyTo(output) }
+                            }
+                            if (lastMod > 0L) {
+                                runCatching { targetFile.setLastModified(lastMod) }
                             }
                             if (targetFile.exists() && targetFile.length() > 512L) {
                                 enqueueFileAnalysis(context, targetFile.absolutePath, forceReprocess = true)
@@ -340,6 +358,9 @@ class CallMonitoringForegroundService : Service() {
             val targetFile = File(context.cacheDir, finalName)
             context.contentResolver.openInputStream(docUri)?.use { input ->
                 FileOutputStream(targetFile).use { output -> input.copyTo(output) }
+            }
+            if (bestMod > 0L) {
+                runCatching { targetFile.setLastModified(bestMod) }
             }
             targetFile.takeIf { it.exists() && it.length() > 0L }
         }.getOrNull()
@@ -442,8 +463,8 @@ class CallMonitoringForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        // 서비스가 처음 켜질 때 현재 시각 이전의 모든 과거 녹음 파일을 기준선(seen)으로 묶어 과거 파일 자동 실행을 차단
-        initializeOrResetBaseline(applicationContext, forceResetToNow = true)
+        // 최초 설치 시에만 현재 시각으로 기준선을 설정하고, 이미 동작 중이던 서비스가 재시작될 때는 기존 Watermark를 유지하여 통화 직후 누락 방지
+        initializeOrResetBaseline(applicationContext, forceResetToNow = false)
         startForegroundWithNotification()
         startWatchingCallDirectories()
         registerMediaStoreObserver()
@@ -482,7 +503,7 @@ class CallMonitoringForegroundService : Service() {
 
         val notification = NotificationCompat.Builder(this, MONITOR_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_call)
-            .setContentTitle("새 통화 녹음만 실시간 감지 중 (v3.3)")
+            .setContentTitle("새 통화 녹음만 실시간 감지 중 (v3.4)")
             .setContentText(folderSummary)
             .setOngoing(true)
             .build()

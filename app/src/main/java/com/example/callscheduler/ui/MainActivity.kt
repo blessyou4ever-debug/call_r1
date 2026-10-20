@@ -153,7 +153,7 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v3.3)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v3.4)", style = MaterialTheme.typography.titleLarge)
                                 Text(
                                     "과거 통화 녹음 자동 불러오기 완벽 차단 + 통화 종료 직후 새 녹음만 실시간 감지",
                                     style = MaterialTheme.typography.bodySmall
@@ -642,8 +642,8 @@ class MainActivity : ComponentActivity() {
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
         if (hasAudioPerm) {
-            // 앱 시작 시 기존 폴더/MediaStore의 과거 파일들을 모두 seen으로 등록해 과거 파일 자동 분석을 방지
-            CallMonitoringForegroundService.initializeOrResetBaseline(this, forceResetToNow = true)
+            // 최초 실행 시에만 기준선을 현재로 잡으며, 이미 감시 중일 때 앱을 열면 기존 기준선을 유지해 통화 직후 새 녹음이 누락되지 않도록 보호
+            CallMonitoringForegroundService.initializeOrResetBaseline(this, forceResetToNow = false)
             runCatching {
                 val serviceIntent = Intent(this, CallMonitoringForegroundService::class.java)
                 ContextCompat.startForegroundService(this, serviceIntent)
@@ -699,12 +699,19 @@ class MainActivity : ComponentActivity() {
     private suspend fun copyUriToCacheFile(context: Context, uri: Uri): File? = withContext(Dispatchers.IO) {
         runCatching {
             var displayName = "통화 선택파일_${System.currentTimeMillis()}.m4u"
+            var originalLastModified = 0L
             context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (nameIndex >= 0 && cursor.moveToFirst()) {
-                    val rawName = cursor.getString(nameIndex)
-                    if (!rawName.isNullOrBlank()) {
-                        displayName = rawName
+                if (cursor.moveToFirst()) {
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex >= 0) {
+                        val rawName = cursor.getString(nameIndex)
+                        if (!rawName.isNullOrBlank()) {
+                            displayName = rawName
+                        }
+                    }
+                    val modIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                    if (modIndex >= 0 && !cursor.isNull(modIndex)) {
+                        originalLastModified = cursor.getLong(modIndex)
                     }
                 }
             }
@@ -717,6 +724,10 @@ class MainActivity : ComponentActivity() {
                 FileOutputStream(targetFile).use { output ->
                     input.copyTo(output)
                 }
+            }
+            // 파일명에 날짜가 없는 녹음이라도 원본 파일의 수정 일시(통화 종료 시각)를 그대로 보존하여 '내일/모레' 계산 오차를 방지
+            if (originalLastModified > 0L) {
+                runCatching { targetFile.setLastModified(originalLastModified) }
             }
             targetFile.takeIf { it.exists() && it.length() > 0L }
         }.getOrNull()

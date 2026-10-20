@@ -13,6 +13,7 @@ import com.example.callscheduler.data.calendar.CalendarSyncResult
 import com.example.callscheduler.data.calendar.GoogleCalendarSyncManager
 import com.example.callscheduler.data.local.db.ActionItemEntity
 import com.example.callscheduler.data.local.db.AppDatabase
+import com.example.callscheduler.data.parser.CallFilenameParser
 import com.example.callscheduler.service.ConfirmationNotificationHelper
 import kotlinx.coroutines.launch
 import java.time.Instant
@@ -120,9 +121,9 @@ class ActionEditBottomSheetActivity : ComponentActivity() {
                                         val parsedEndMillis = parsedStartMillis + durationMin * 60_000L
 
                                         val updated = current.copy(
-                                            title = title,
-                                            description = description,
-                                            location = location.ifBlank { null },
+                                            title = CallFilenameParser.stripPhoneNumbers(title).ifBlank { current.title },
+                                            description = CallFilenameParser.stripPhoneNumbers(description),
+                                            location = location.let { CallFilenameParser.stripPhoneNumbers(it) }.ifBlank { null },
                                             startEpochMillis = parsedStartMillis,
                                             endEpochMillis = parsedEndMillis,
                                             status = "CONFIRMED"

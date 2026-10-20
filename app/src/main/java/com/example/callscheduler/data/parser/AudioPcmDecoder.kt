@@ -24,74 +24,83 @@ object AudioPcmDecoder {
      * 모든 통화 녹음(.m4u, .m4a, .amr, .mp3, .wav, .3gp 등)을 디코딩한 뒤
      * Android SpeechRecognizer 및 Gemini WAV 폴백에서 100% 호환되는
      * 표준 [16,000Hz · Mono(1채널) · 16-bit Little-Endian PCM]으로 즉시 리샘플링 및 볼륨 정규화합니다.
+     * MediaExtractor 및 MediaCodec 전체 수명주기를 try/finally로 보호하여 손상된 파일에서도 네이티브 리소스 누수를 방지합니다.
      */
     fun decodeToPcmInfo(inputAudioFile: File, outputPcmFile: File): Result<DecodedPcmInfo> = runCatching {
         val extractor = MediaExtractor()
-        extractor.setDataSource(inputAudioFile.absolutePath)
-
-        var audioTrackIndex = -1
-        var format: MediaFormat? = null
-        for (i in 0 until extractor.trackCount) {
-            val trackFormat = extractor.getTrackFormat(i)
-            val mime = trackFormat.getString(MediaFormat.KEY_MIME) ?: ""
-            if (mime.startsWith("audio/")) {
-                audioTrackIndex = i
-                format = trackFormat
-                break
-            }
-        }
-
-        require(audioTrackIndex >= 0 && format != null) { "오디오 트랙을 찾을 수 없습니다." }
-        extractor.selectTrack(audioTrackIndex)
-
-        val srcSampleRate = runCatching { format.getInteger(MediaFormat.KEY_SAMPLE_RATE) }.getOrDefault(16000)
-        val srcChannels = runCatching { format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) }.getOrDefault(1).coerceAtLeast(1)
-        val mime = format.getString(MediaFormat.KEY_MIME)!!
-        val codec = MediaCodec.createDecoderByType(mime)
-        codec.configure(format, null, null, 0)
-        codec.start()
-
-        val bufferInfo = MediaCodec.BufferInfo()
-        var isEOS = false
-        val rawOut = ByteArrayOutputStream((inputAudioFile.length().toInt() * 3).coerceIn(65536, 8 * 1024 * 1024))
+        var codec: MediaCodec? = null
+        val srcSampleRate: Int
+        val srcChannels: Int
+        val rawOut: ByteArrayOutputStream
 
         try {
+            extractor.setDataSource(inputAudioFile.absolutePath)
+
+            var audioTrackIndex = -1
+            var format: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val trackFormat = extractor.getTrackFormat(i)
+                val mime = trackFormat.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("audio/")) {
+                    audioTrackIndex = i
+                    format = trackFormat
+                    break
+                }
+            }
+
+            require(audioTrackIndex >= 0 && format != null) { "오디오 트랙을 찾을 수 없습니다." }
+            extractor.selectTrack(audioTrackIndex)
+
+            srcSampleRate = runCatching { format.getInteger(MediaFormat.KEY_SAMPLE_RATE) }.getOrDefault(16000)
+            srcChannels = runCatching { format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) }.getOrDefault(1).coerceAtLeast(1)
+            val mime = format.getString(MediaFormat.KEY_MIME)!!
+            val createdCodec = MediaCodec.createDecoderByType(mime)
+            codec = createdCodec
+            createdCodec.configure(format, null, null, 0)
+            createdCodec.start()
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var isEOS = false
+            rawOut = ByteArrayOutputStream((inputAudioFile.length().toInt() * 3).coerceIn(65536, 8 * 1024 * 1024))
+
             while (!isEOS) {
-                val inIndex = codec.dequeueInputBuffer(8_000)
+                val inIndex = createdCodec.dequeueInputBuffer(8_000)
                 if (inIndex >= 0) {
-                    val inputBuffer = codec.getInputBuffer(inIndex)
+                    val inputBuffer = createdCodec.getInputBuffer(inIndex)
                     if (inputBuffer != null) {
                         val sampleSize = extractor.readSampleData(inputBuffer, 0)
                         if (sampleSize < 0) {
-                            codec.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            createdCodec.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             isEOS = true
                         } else {
-                            codec.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
+                            createdCodec.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
                             extractor.advance()
                         }
                     }
                 }
 
-                var outIndex = codec.dequeueOutputBuffer(bufferInfo, 8_000)
+                var outIndex = createdCodec.dequeueOutputBuffer(bufferInfo, 8_000)
                 while (outIndex >= 0) {
-                    val outputBuffer = codec.getOutputBuffer(outIndex)
+                    val outputBuffer = createdCodec.getOutputBuffer(outIndex)
                     if (outputBuffer != null && bufferInfo.size > 0) {
                         val chunk = ByteArray(bufferInfo.size)
                         outputBuffer.get(chunk)
                         outputBuffer.clear()
                         rawOut.write(chunk)
                     }
-                    codec.releaseOutputBuffer(outIndex, false)
+                    createdCodec.releaseOutputBuffer(outIndex, false)
                     if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                         isEOS = true
                         break
                     }
-                    outIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+                    outIndex = createdCodec.dequeueOutputBuffer(bufferInfo, 0)
                 }
             }
         } finally {
-            runCatching { codec.stop() }
-            runCatching { codec.release() }
+            codec?.let { c ->
+                runCatching { c.stop() }
+                runCatching { c.release() }
+            }
             runCatching { extractor.release() }
         }
 

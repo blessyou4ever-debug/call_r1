@@ -69,8 +69,9 @@ object CallAnalysisRunner {
         existingRecordId: Long? = null,
         overrideMode: EngineMode? = null
     ): Boolean {
-        if (!activePaths.add(filePath)) {
-            // 이미 동일한 파일이 현재 분석 진행 중이면 중복 실행 방지
+        val addedToActive = activePaths.add(filePath)
+        if (!addedToActive && !forceReprocess) {
+            // 자동 감시에서 이미 동일한 파일이 분석 진행 중이면 중복 실행 방지 (단, 사용자의 수동 재시도 클릭은 대기열에서 정상 실행)
             return true
         }
 
