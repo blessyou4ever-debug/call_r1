@@ -79,6 +79,7 @@ class MainActivity : ComponentActivity() {
                 val permissionLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions()
                 ) { grantMap ->
+                    CallMonitoringForegroundService.initializeOrResetBaseline(this, forceResetToNow = true)
                     val serviceIntent = Intent(this, CallMonitoringForegroundService::class.java).apply {
                         action = CallMonitoringForegroundService.ACTION_RESET_BASELINE
                     }
@@ -87,9 +88,9 @@ class MainActivity : ComponentActivity() {
                     }
                     val deniedCount = grantMap.values.count { !it }
                     val msg = if (deniedCount == 0) {
-                        "실시간 감시를 시작했습니다. (통화 종료 후 생성되는 새 녹음을 즉시 감지합니다)"
+                        "실시간 감시를 시작했습니다. (과거 통화 녹음은 제외하고 지금부터 새로 끝나는 통화만 분석합니다)"
                     } else {
-                        "감시 서비스를 시작했습니다. (일부 권한이 거부되어 캘린더 인텐트 연동 모드로 동작할 수 있습니다)"
+                        "감시 서비스를 시작했습니다. (과거 녹음은 제외되며, 일부 권한 거부 시 인텐트 연동 모드로 동작합니다)"
                     }
                     Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
                 }
@@ -111,7 +112,7 @@ class MainActivity : ComponentActivity() {
                             reloadMonitoringDirectories(this@MainActivity)
                             Toast.makeText(
                                 this@MainActivity,
-                                "통화 녹음 폴더가 설정되었습니다: ${resolvedPath}",
+                                "통화 녹음 폴더가 설정되었습니다 (기존 과거 파일은 자동 분석에서 제외됨): ${resolvedPath}",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -152,9 +153,9 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v3.2)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v3.3)", style = MaterialTheme.typography.titleLarge)
                                 Text(
-                                    "429 쿼터 초과 시 타 세대 모델 즉시 우회 + 16kHz 파이프 스트리밍 초고속 내장 STT 탑재",
+                                    "과거 통화 녹음 자동 불러오기 완벽 차단 + 통화 종료 직후 새 녹음만 실시간 감지",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -174,7 +175,7 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier.padding(16.dp),
                                     verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    Text("1. 권한 승인 · 녹음 파일 선택 · 최신 통화 즉시 스캔", style = MaterialTheme.typography.titleMedium)
+                                    Text("1. 권한 승인 · 수동 파일 선택 · 테스트", style = MaterialTheme.typography.titleMedium)
                                     Button(
                                         onClick = {
                                             val perms = mutableListOf(
@@ -192,7 +193,7 @@ class MainActivity : ComponentActivity() {
                                         },
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        Text("권한 허용 및 새 통화 실시간 감시 시작")
+                                        Text("권한 허용 및 새 통화만 실시간 감시 시작 (과거 녹음 제외)")
                                     }
 
                                     FilledTonalButton(
@@ -213,7 +214,7 @@ class MainActivity : ComponentActivity() {
                                                 if (foundName != null) {
                                                     Toast.makeText(
                                                         this@MainActivity,
-                                                        "최신 통화 녹음(${foundName})을 찾아 즉시 분석을 시작했습니다! 하단 5번 로그를 확인하세요.",
+                                                        "최신 통화 녹음(${foundName}) 1건을 수동으로 찾아 분석을 시작했습니다!",
                                                         Toast.LENGTH_LONG
                                                     ).show()
                                                 } else {
@@ -227,7 +228,7 @@ class MainActivity : ComponentActivity() {
                                         },
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        Text("폴더 내 가장 최근 통화 녹음 1건 즉시 찾아 분석하기")
+                                        Text("(수동 실행) 폴더 내 가장 최근 녹음 1건 지금 바로 분석하기")
                                     }
 
                                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
@@ -265,7 +266,7 @@ class MainActivity : ComponentActivity() {
                                 ) {
                                     Text("2. 통화 녹음 폴더 경로 설정 (기기·전화 앱별 맞춤)", style = MaterialTheme.typography.titleMedium)
                                     val statusDesc = if (customCallDir.isBlank()) {
-                                        "현재: 통합 자동 감시 (삼성 Recordings/Call + T전화 TPhoneCallRecords 모두 감시)"
+                                        "현재: 통합 자동 감시 (삼성 Recordings/Call + T전화 TPhoneCallRecords 새 파일만 감시)"
                                     } else {
                                         val exists = File(customCallDir).exists()
                                         "현재 지정 경로: ${customCallDir} (${if (exists) "폴더 확인됨" else "SAF/폴더 감시 중"})"
@@ -289,7 +290,7 @@ class MainActivity : ComponentActivity() {
                                                     reloadMonitoringDirectories(this@MainActivity)
                                                     Toast.makeText(
                                                         this@MainActivity,
-                                                        "[${preset.label}] 경로로 설정되었습니다.",
+                                                        "[${preset.label}] 경로로 설정되었습니다 (기존 파일 제외).",
                                                         Toast.LENGTH_SHORT
                                                     ).show()
                                                 }
@@ -317,7 +318,7 @@ class MainActivity : ComponentActivity() {
                                                     reloadMonitoringDirectories(this@MainActivity)
                                                     Toast.makeText(
                                                         this@MainActivity,
-                                                        "통화 녹음 폴더 경로가 저장 및 적용되었습니다.",
+                                                        "통화 녹음 폴더 경로가 저장되었습니다 (과거 녹음 제외).",
                                                         Toast.LENGTH_SHORT
                                                     ).show()
                                                 }
@@ -482,7 +483,11 @@ class MainActivity : ComponentActivity() {
                                             scope.launch {
                                                 CallMonitoringForegroundService.initializeOrResetBaseline(this@MainActivity, forceResetToNow = true)
                                                 dao.clearAllHistory()
-                                                Toast.makeText(this@MainActivity, "기존 목록과 로그를 모두 비웠습니다.", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(
+                                                    this@MainActivity,
+                                                    "기존 목록과 로그를 모두 비우고 현재 시각으로 기준선을 재설정했습니다.",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
                                             }
                                         }
                                     ) {
@@ -569,7 +574,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
                                     Text(
-                                        "기존 2분 30초 지연 원인을 제거하여 이제 3~6초 내에 초고속으로 결과가 표시됩니다.",
+                                        "이제 과거 녹음 파일은 자동으로 불러오지 않으며, 방금 끝난 새 통화나 수동 선택한 녹음만 3~6초 내에 분석합니다.",
                                         style = MaterialTheme.typography.bodySmall
                                     )
                                 }
@@ -637,6 +642,8 @@ class MainActivity : ComponentActivity() {
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
         if (hasAudioPerm) {
+            // 앱 시작 시 기존 폴더/MediaStore의 과거 파일들을 모두 seen으로 등록해 과거 파일 자동 분석을 방지
+            CallMonitoringForegroundService.initializeOrResetBaseline(this, forceResetToNow = true)
             runCatching {
                 val serviceIntent = Intent(this, CallMonitoringForegroundService::class.java)
                 ContextCompat.startForegroundService(this, serviceIntent)
@@ -667,7 +674,7 @@ class MainActivity : ComponentActivity() {
             action = CallMonitoringForegroundService.ACTION_RELOAD_DIRS
         }
         runCatching {
-            ContextCompat.startForegroundService(context, serviceIntent)
+            ContextCompat.startForegroundService(this, serviceIntent)
         }
     }
 
