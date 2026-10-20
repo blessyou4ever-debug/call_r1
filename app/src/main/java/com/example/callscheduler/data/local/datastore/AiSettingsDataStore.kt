@@ -7,8 +7,8 @@ import org.json.JSONObject
 import java.io.File
 
 enum class EngineMode(val label: String) {
-    ON_DEVICE("온디바이스 우선 (무료·보안)"),
-    AUTO_FALLBACK("하이브리드 (Gemini 우선 · 실패 시 온디바이스 자동전환)"),
+    ON_DEVICE("온디바이스 내장 엔진 우선 (무료·쿼터 무제한)"),
+    AUTO_FALLBACK("하이브리드 (Gemini 다중모델 우선 · 쿼터초과 시 내장엔진 즉시전환)"),
     CLOUD_API("클라우드 API 고정 (최고 인식률)")
 }
 
@@ -46,7 +46,7 @@ class AiSettingsDataStore(context: Context) {
         private val apiKeyState = MutableStateFlow("")
         private val customCallDirState = MutableStateFlow("")
         private val customTreeUriState = MutableStateFlow("")
-        private val preferredModelState = MutableStateFlow("gemini-3.8-flash")
+        private val preferredModelState = MutableStateFlow("gemini-2.5-flash-lite")
         private var initialized = false
     }
 
@@ -56,7 +56,7 @@ class AiSettingsDataStore(context: Context) {
             var savedKey = prefs.getString(KEY_GEMINI_API_KEY, "") ?: ""
             var savedDir = prefs.getString(KEY_CUSTOM_CALL_DIR, "") ?: ""
             val savedTreeUri = prefs.getString(KEY_CUSTOM_TREE_URI, "") ?: ""
-            val savedModel = prefs.getString(KEY_PREFERRED_MODEL, "gemini-3.8-flash") ?: "gemini-3.8-flash"
+            val savedModel = prefs.getString(KEY_PREFERRED_MODEL, "gemini-2.5-flash-lite") ?: "gemini-2.5-flash-lite"
 
             if (savedKey.isBlank() && savedDir.isBlank() && savedMode == null) {
                 val restored = tryRestoreFromAutoBackupFile()
@@ -77,7 +77,7 @@ class AiSettingsDataStore(context: Context) {
             apiKeyState.value = savedKey
             customCallDirState.value = savedDir
             customTreeUriState.value = savedTreeUri
-            preferredModelState.value = savedModel.ifBlank { "gemini-3.8-flash" }
+            preferredModelState.value = savedModel.ifBlank { "gemini-2.5-flash-lite" }
             initialized = true
         }
     }
@@ -157,7 +157,7 @@ class AiSettingsDataStore(context: Context) {
             val key = obj.optString("gemini_api_key", "").trim()
             val dir = obj.optString("custom_call_dir", "").trim().removeSuffix("/")
             val treeUri = obj.optString("custom_tree_uri", "").trim()
-            val model = obj.optString("preferred_gemini_model", "gemini-3.8-flash").trim().ifBlank { "gemini-3.8-flash" }
+            val model = obj.optString("preferred_gemini_model", "gemini-2.5-flash-lite").trim().ifBlank { "gemini-2.5-flash-lite" }
 
             prefs.edit()
                 .putString(KEY_ENGINE_MODE, mode.name)
