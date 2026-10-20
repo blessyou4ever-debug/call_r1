@@ -8,7 +8,7 @@ import java.io.File
 
 enum class EngineMode(val label: String) {
     ON_DEVICE("온디바이스 우선 (무료·보안)"),
-    AUTO_FALLBACK("하이브리드 (인식률 저하 시 클라우드 전환)"),
+    AUTO_FALLBACK("하이브리드 (Gemini 우선 · 실패 시 온디바이스 자동전환)"),
     CLOUD_API("클라우드 API 고정 (최고 인식률)")
 }
 
@@ -24,6 +24,7 @@ class AiSettingsDataStore(context: Context) {
         private const val KEY_ENGINE_MODE = "engine_mode"
         private const val KEY_GEMINI_API_KEY = "gemini_api_key"
         private const val KEY_CUSTOM_CALL_DIR = "custom_call_dir"
+        private const val KEY_CUSTOM_TREE_URI = "custom_tree_uri"
         private const val KEY_PREFERRED_MODEL = "preferred_gemini_model"
 
         private val AUTO_BACKUP_FILES = listOf(
@@ -44,6 +45,7 @@ class AiSettingsDataStore(context: Context) {
         private val modeState = MutableStateFlow(EngineMode.AUTO_FALLBACK)
         private val apiKeyState = MutableStateFlow("")
         private val customCallDirState = MutableStateFlow("")
+        private val customTreeUriState = MutableStateFlow("")
         private val preferredModelState = MutableStateFlow("gemini-3.8-flash")
         private var initialized = false
     }
@@ -53,9 +55,9 @@ class AiSettingsDataStore(context: Context) {
             var savedMode = prefs.getString(KEY_ENGINE_MODE, null)
             var savedKey = prefs.getString(KEY_GEMINI_API_KEY, "") ?: ""
             var savedDir = prefs.getString(KEY_CUSTOM_CALL_DIR, "") ?: ""
+            val savedTreeUri = prefs.getString(KEY_CUSTOM_TREE_URI, "") ?: ""
             val savedModel = prefs.getString(KEY_PREFERRED_MODEL, "gemini-3.8-flash") ?: "gemini-3.8-flash"
 
-            // 앱 삭제 후 재설치되어 SharedPreferences가 비어있을 경우 외장 백업 파일에서 자동 복원 시도
             if (savedKey.isBlank() && savedDir.isBlank() && savedMode == null) {
                 val restored = tryRestoreFromAutoBackupFile()
                 if (restored != null) {
@@ -74,6 +76,7 @@ class AiSettingsDataStore(context: Context) {
             modeState.value = runCatching { EngineMode.valueOf(finalModeName) }.getOrDefault(EngineMode.AUTO_FALLBACK)
             apiKeyState.value = savedKey
             customCallDirState.value = savedDir
+            customTreeUriState.value = savedTreeUri
             preferredModelState.value = savedModel.ifBlank { "gemini-3.8-flash" }
             initialized = true
         }
@@ -82,11 +85,13 @@ class AiSettingsDataStore(context: Context) {
     val engineModeFlow: Flow<EngineMode> = modeState
     val apiKeyFlow: Flow<String> = apiKeyState
     val customCallDirFlow: Flow<String> = customCallDirState
+    val customTreeUriFlow: Flow<String> = customTreeUriState
     val preferredModelFlow: Flow<String> = preferredModelState
 
     fun getCurrentMode(): EngineMode = modeState.value
     fun getCurrentApiKey(): String = apiKeyState.value
     fun getCustomCallDir(): String = customCallDirState.value
+    fun getCustomTreeUri(): String = customTreeUriState.value
     fun getPreferredModel(): String = preferredModelState.value
 
     fun setPreferredModelSync(modelName: String) {
@@ -122,9 +127,14 @@ class AiSettingsDataStore(context: Context) {
         writeAutoBackupFile()
     }
 
-    suspend fun setCustomCallDir(dirPath: String) {
+    suspend fun setCustomCallDir(dirPath: String, treeUriStr: String? = null) {
         val trimmed = dirPath.trim().removeSuffix("/")
-        prefs.edit().putString(KEY_CUSTOM_CALL_DIR, trimmed).apply()
+        val editor = prefs.edit().putString(KEY_CUSTOM_CALL_DIR, trimmed)
+        if (treeUriStr != null) {
+            editor.putString(KEY_CUSTOM_TREE_URI, treeUriStr)
+            customTreeUriState.value = treeUriStr
+        }
+        editor.apply()
         customCallDirState.value = trimmed
         writeAutoBackupFile()
     }
@@ -134,6 +144,7 @@ class AiSettingsDataStore(context: Context) {
             put("engine_mode", modeState.value.name)
             put("gemini_api_key", apiKeyState.value)
             put("custom_call_dir", customCallDirState.value)
+            put("custom_tree_uri", customTreeUriState.value)
             put("preferred_gemini_model", preferredModelState.value)
         }.toString()
     }
@@ -145,18 +156,21 @@ class AiSettingsDataStore(context: Context) {
             val mode = runCatching { EngineMode.valueOf(modeName) }.getOrDefault(EngineMode.AUTO_FALLBACK)
             val key = obj.optString("gemini_api_key", "").trim()
             val dir = obj.optString("custom_call_dir", "").trim().removeSuffix("/")
+            val treeUri = obj.optString("custom_tree_uri", "").trim()
             val model = obj.optString("preferred_gemini_model", "gemini-3.8-flash").trim().ifBlank { "gemini-3.8-flash" }
 
             prefs.edit()
                 .putString(KEY_ENGINE_MODE, mode.name)
                 .putString(KEY_GEMINI_API_KEY, key)
                 .putString(KEY_CUSTOM_CALL_DIR, dir)
+                .putString(KEY_CUSTOM_TREE_URI, treeUri)
                 .putString(KEY_PREFERRED_MODEL, model)
                 .apply()
 
             modeState.value = mode
             apiKeyState.value = key
             customCallDirState.value = dir
+            customTreeUriState.value = treeUri
             preferredModelState.value = model
             writeAutoBackupFile()
             true

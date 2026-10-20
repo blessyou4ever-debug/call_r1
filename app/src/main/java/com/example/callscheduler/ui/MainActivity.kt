@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -24,10 +25,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.work.Data
-import androidx.work.ExistingWorkPolicy
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
 import com.example.callscheduler.data.ai.CloudGeminiEngine
 import com.example.callscheduler.data.calendar.CalendarSyncResult
 import com.example.callscheduler.data.calendar.GoogleCalendarSyncManager
@@ -36,8 +33,8 @@ import com.example.callscheduler.data.local.datastore.EngineMode
 import com.example.callscheduler.data.local.db.ActionItemEntity
 import com.example.callscheduler.data.local.db.AppDatabase
 import com.example.callscheduler.data.local.db.CallRecordEntity
+import com.example.callscheduler.service.CallAnalysisRunner
 import com.example.callscheduler.service.CallMonitoringForegroundService
-import com.example.callscheduler.service.CallProcessWorker
 import com.example.callscheduler.service.ConfirmationNotificationHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -53,6 +50,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 앱을 열었을 때 오디오/저장소 권한이 이미 허용되어 있다면 백그라운드 통화 감시 서비스를 즉시 자동 시작합니다.
+        autoStartMonitoringServiceIfPermitted()
 
         val settingsDataStore = AiSettingsDataStore(this)
         val cloudDiagnosticEngine = CloudGeminiEngine(settingsDataStore)
@@ -88,7 +88,7 @@ class MainActivity : ComponentActivity() {
                     }
                     val deniedCount = grantMap.values.count { !it }
                     val msg = if (deniedCount == 0) {
-                        "실시간 감시를 시작했습니다. (기존 녹음은 제외하고 지금부터 새로 생성되는 통화만 자동 분석합니다)"
+                        "실시간 감시를 시작했습니다. (통화 종료 후 생성되는 새 녹음을 즉시 감지합니다)"
                     } else {
                         "감시 서비스를 시작했습니다. (일부 권한이 거부되어 캘린더 인텐트 연동 모드로 동작할 수 있습니다)"
                     }
@@ -105,23 +105,15 @@ class MainActivity : ComponentActivity() {
                                 Intent.FLAG_GRANT_READ_URI_PERMISSION
                             )
                         }
-                        val resolvedPath = resolveTreeUriToFilePath(treeUri)
-                        if (!resolvedPath.isNullOrBlank()) {
-                            customDirInput = resolvedPath
-                            scope.launch {
-                                settingsDataStore.setCustomCallDir(resolvedPath)
-                                reloadMonitoringDirectories(this@MainActivity)
-                                Toast.makeText(
-                                    this@MainActivity,
-                                    "통화 녹음 폴더가 설정되었습니다: ${resolvedPath}",
-                                    Toast.LENGTH_LONG
-                                ).show()
-                            }
-                        } else {
+                        val resolvedPath = resolveTreeUriToFilePath(treeUri) ?: customDirInput
+                        customDirInput = resolvedPath
+                        scope.launch {
+                            settingsDataStore.setCustomCallDir(resolvedPath, treeUri.toString())
+                            reloadMonitoringDirectories(this@MainActivity)
                             Toast.makeText(
                                 this@MainActivity,
-                                "선택한 폴더 경로를 확인해 주세요.",
-                                Toast.LENGTH_SHORT
+                                "통화 녹음 폴더가 설정되었습니다: ${resolvedPath}",
+                                Toast.LENGTH_LONG
                             ).show()
                         }
                     }
@@ -132,22 +124,26 @@ class MainActivity : ComponentActivity() {
                 ) { uri: Uri? ->
                     if (uri != null) {
                         scope.launch {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "선택한 오디오 파일을 불러오는 중입니다...",
+                                Toast.LENGTH_SHORT
+                            ).show()
                             val copiedFile = copyUriToCacheFile(this@MainActivity, uri)
-                            if (copiedFile != null) {
-                                enqueueReprocessCallRecord(
+                            if (copiedFile != null && copiedFile.length() > 0L) {
+                                CallAnalysisRunner.triggerAnalysisNow(
                                     context = this@MainActivity,
                                     filePath = copiedFile.absolutePath,
-                                    existingRecordId = null,
-                                    overrideMode = null,
+                                    forceReprocess = true,
                                     forceCloudOnly = false
                                 )
                                 Toast.makeText(
                                     this@MainActivity,
-                                    "선택한 녹음 파일(${copiedFile.name}) 분석을 시작했습니다.",
-                                    Toast.LENGTH_SHORT
+                                    "하단 [5. 최근 통화 분석 로그]에서 실시간 분석 진행 상태를 확인하세요!",
+                                    Toast.LENGTH_LONG
                                 ).show()
                             } else {
-                                Toast.makeText(this@MainActivity, "오디오 파일을 읽을 수 없습니다.", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(this@MainActivity, "오디오 파일을 읽을 수 없거나 비어 있습니다.", Toast.LENGTH_LONG).show()
                             }
                         }
                     }
@@ -157,9 +153,9 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v3.0)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v3.1)", style = MaterialTheme.typography.titleLarge)
                                 Text(
-                                    "최신 gemini-3.8-flash 기본 탑재 + [Gemini API로 재시도] 전용 버튼 및 연결 진단",
+                                    "통화 종료 즉시 감지 + 수동 파일 선택 0.1초 즉시 실행 및 실시간 진행 카드 표시",
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -179,7 +175,7 @@ class MainActivity : ComponentActivity() {
                                     modifier = Modifier.padding(16.dp),
                                     verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    Text("1. 권한 승인 · 녹음 파일 선택 · 즉시 스캔", style = MaterialTheme.typography.titleMedium)
+                                    Text("1. 권한 승인 · 녹음 파일 선택 · 최신 통화 즉시 스캔", style = MaterialTheme.typography.titleMedium)
                                     Button(
                                         onClick = {
                                             val perms = mutableListOf(
@@ -197,7 +193,7 @@ class MainActivity : ComponentActivity() {
                                         },
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        Text("권한 허용 및 새 통화 실시간 감시 시작 (기존 파일 제외)")
+                                        Text("권한 허용 및 새 통화 실시간 감시 시작")
                                     }
 
                                     FilledTonalButton(
@@ -206,7 +202,33 @@ class MainActivity : ComponentActivity() {
                                         },
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        Text("내 폰의 통화 녹음 파일(.m4u/.m4a 등) 직접 선택하여 분석")
+                                        Text("내 폰의 통화 녹음 파일(.m4u/.m4a 등) 직접 선택하여 즉시 분석")
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            scope.launch {
+                                                val foundName = withContext(Dispatchers.IO) {
+                                                    CallMonitoringForegroundService.forceAnalyzeLatestRecordingInFolders(this@MainActivity)
+                                                }
+                                                if (foundName != null) {
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "최신 통화 녹음(${foundName})을 찾아 즉시 분석을 시작했습니다! 하단 5번 로그를 확인하세요.",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                } else {
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "감시 폴더에서 녹음 파일을 찾지 못했습니다. [2. 통화 녹음 폴더 경로 설정]에서 폴더를 지정해 주세요.",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("폴더 내 가장 최근 통화 녹음 1건 즉시 찾아 분석하기")
                                     }
 
                                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
@@ -220,17 +242,13 @@ class MainActivity : ComponentActivity() {
                                     OutlinedButton(
                                         onClick = {
                                             val samplePath = "/storage/emulated/0/Recordings/TPhoneCallRecords/김대리_01012345678_20261019143022.m4u"
-                                            val input = Data.Builder()
-                                                .putString("KEY_FILE_PATH", samplePath)
-                                                .putString("KEY_SIMULATED_TRANSCRIPT", customTestText)
-                                                .putBoolean("KEY_FORCE_REPROCESS", true)
-                                                .build()
-                                            WorkManager.getInstance(this@MainActivity).enqueue(
-                                                OneTimeWorkRequestBuilder<CallProcessWorker>()
-                                                    .setInputData(input)
-                                                    .build()
+                                            CallAnalysisRunner.triggerAnalysisNow(
+                                                context = this@MainActivity,
+                                                filePath = samplePath,
+                                                simulatedTranscript = customTestText,
+                                                forceReprocess = true
                                             )
-                                            Toast.makeText(this@MainActivity, "T전화 형식(이름만 추출) 테스트 분석을 실행했습니다.", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(this@MainActivity, "시뮬레이션 분석을 즉시 실행했습니다.", Toast.LENGTH_SHORT).show()
                                         },
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
@@ -251,7 +269,7 @@ class MainActivity : ComponentActivity() {
                                         "현재: 통합 자동 감시 (삼성 Recordings/Call + T전화 TPhoneCallRecords 모두 감시)"
                                     } else {
                                         val exists = File(customCallDir).exists()
-                                        "현재 지정 경로: ${customCallDir} (${if (exists) "폴더 확인됨" else "폴더 생성 시 자동 감시"})"
+                                        "현재 지정 경로: ${customCallDir} (${if (exists) "폴더 확인됨" else "SAF/폴더 감시 중"})"
                                     }
                                     Text(statusDesc, style = MaterialTheme.typography.bodySmall)
 
@@ -259,7 +277,7 @@ class MainActivity : ComponentActivity() {
                                         onClick = { folderPickerLauncher.launch(null) },
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        Text("스마트폰 폴더 탐색기로 통화 녹음 폴더 직접 선택")
+                                        Text("스마트폰 폴더 탐색기로 통화 녹음 폴더 직접 선택 (권장)")
                                     }
 
                                     Text("또는 사용하는 전화 앱 기본 경로 빠른 선택:", style = MaterialTheme.typography.labelMedium)
@@ -313,7 +331,7 @@ class MainActivity : ComponentActivity() {
                                             onClick = {
                                                 customDirInput = ""
                                                 scope.launch {
-                                                    settingsDataStore.setCustomCallDir("")
+                                                    settingsDataStore.setCustomCallDir("", "")
                                                     reloadMonitoringDirectories(this@MainActivity)
                                                     Toast.makeText(
                                                         this@MainActivity,
@@ -349,7 +367,7 @@ class MainActivity : ComponentActivity() {
 
                                     if (currentMode != EngineMode.ON_DEVICE) {
                                         Text(
-                                            "현재 우선 호출 모델: ${preferredModel} (구버전 2.5 차단 해결 완료)",
+                                            "현재 우선 호출 모델: ${preferredModel} (최대 3개 모델 고속 호출)",
                                             style = MaterialTheme.typography.labelMedium
                                         )
                                         OutlinedTextField(
@@ -542,7 +560,7 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                     Toast.makeText(
                                                         this@MainActivity,
-                                                        "폴백·실패 항목 ${count}건을 gemini-3.8-flash API로 일괄 재시도합니다.",
+                                                        "폴백·실패 항목 ${count}건을 ${preferredModel} API로 즉시 재시도합니다.",
                                                         Toast.LENGTH_SHORT
                                                     ).show()
                                                 }
@@ -552,7 +570,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
                                     Text(
-                                        "이제 [Gemini API로 재시도]를 누르면 구버전(2.5) 대신 최신 gemini-3.8-flash 모델로 즉시 호출합니다.",
+                                        "수동 선택한 파일이나 새 통화 녹음은 즉시 아래에 '⏳ 분석 진행 중...' 카드로 표시되며 완료 즉시 결과가 나타납니다.",
                                         style = MaterialTheme.typography.bodySmall
                                     )
                                 }
@@ -571,7 +589,7 @@ class MainActivity : ComponentActivity() {
                                             )
                                             Toast.makeText(
                                                 this@MainActivity,
-                                                "${rec.contactName} 통화 녹음을 Gemini API(${preferredModel})로 재시도합니다...",
+                                                "${rec.contactName} 통화 녹음을 Gemini API(${preferredModel})로 즉시 재시도합니다...",
                                                 Toast.LENGTH_SHORT
                                             ).show()
                                         } else {
@@ -593,7 +611,7 @@ class MainActivity : ComponentActivity() {
                                             )
                                             Toast.makeText(
                                                 this@MainActivity,
-                                                "${rec.contactName} 통화 녹음을 온디바이스 엔진으로 재분석합니다...",
+                                                "${rec.contactName} 통화 녹음을 온디바이스 엔진으로 즉시 재분석합니다...",
                                                 Toast.LENGTH_SHORT
                                             ).show()
                                         } else {
@@ -613,6 +631,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun autoStartMonitoringServiceIfPermitted() {
+        val hasAudioPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+        if (hasAudioPerm) {
+            runCatching {
+                val serviceIntent = Intent(this, CallMonitoringForegroundService::class.java)
+                ContextCompat.startForegroundService(this, serviceIntent)
+            }
+        }
+    }
+
     private fun enqueueReprocessCallRecord(
         context: Context,
         filePath: String,
@@ -620,23 +652,14 @@ class MainActivity : ComponentActivity() {
         overrideMode: EngineMode?,
         forceCloudOnly: Boolean
     ) {
-        val builder = Data.Builder()
-            .putString("KEY_FILE_PATH", filePath)
-            .putBoolean("KEY_FORCE_REPROCESS", true)
-            .putBoolean("KEY_FORCE_CLOUD_ONLY", forceCloudOnly)
-        if (existingRecordId != null && existingRecordId > 0L) {
-            builder.putLong("KEY_EXISTING_RECORD_ID", existingRecordId)
-        }
-        if (overrideMode != null) {
-            builder.putString("KEY_OVERRIDE_MODE", overrideMode.name)
-        }
-        val req = OneTimeWorkRequestBuilder<CallProcessWorker>()
-            .setInputData(builder.build())
-            .build()
-        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
-            "reanalyze_${filePath.hashCode()}",
-            ExistingWorkPolicy.REPLACE,
-            req
+        // WorkManager 큐에서 멈추지 않도록 즉시 직접 실행 엔진(CallAnalysisRunner)을 호출합니다.
+        CallAnalysisRunner.triggerAnalysisNow(
+            context = context.applicationContext,
+            filePath = filePath,
+            forceReprocess = true,
+            forceCloudOnly = forceCloudOnly,
+            existingRecordId = existingRecordId,
+            overrideMode = overrideMode
         )
     }
 
@@ -670,20 +693,28 @@ class MainActivity : ComponentActivity() {
 
     private suspend fun copyUriToCacheFile(context: Context, uri: Uri): File? = withContext(Dispatchers.IO) {
         runCatching {
-            var displayName = "통화 선택파일_261018_121018.m4u"
+            var displayName = "통화 선택파일_${System.currentTimeMillis()}.m4u"
             context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                 val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (nameIndex >= 0 && cursor.moveToFirst()) {
-                    displayName = cursor.getString(nameIndex) ?: displayName
+                    val rawName = cursor.getString(nameIndex)
+                    if (!rawName.isNullOrBlank()) {
+                        displayName = rawName
+                    }
                 }
             }
-            val targetFile = File(context.cacheDir, displayName)
+            // 파일명에 확장자가 없을 경우 기본 .m4a 부여
+            if (!displayName.contains('.')) {
+                displayName = "${displayName}.m4a"
+            }
+            val safeFileName = displayName.replace(Regex("""[\\/:*?"<>|]"""), "_")
+            val targetFile = File(context.cacheDir, safeFileName)
             context.contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(targetFile).use { output ->
                     input.copyTo(output)
                 }
             }
-            targetFile
+            targetFile.takeIf { it.exists() && it.length() > 0L }
         }.getOrNull()
     }
 }
@@ -730,6 +761,7 @@ fun CallRecordLogCard(
     onRetryOnDevice: () -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.KOREA) }
+    val isAnalyzing = record.engineUsed.startsWith("⏳")
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(
@@ -740,6 +772,9 @@ fun CallRecordLogCard(
                 "기준 일시: ${dateFormat.format(Date(record.callTimestampEpochMillis))}",
                 style = MaterialTheme.typography.bodySmall
             )
+            if (isAnalyzing) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
             Text(record.transcript, style = MaterialTheme.typography.bodySmall)
 
             Row(
@@ -748,12 +783,14 @@ fun CallRecordLogCard(
             ) {
                 Button(
                     onClick = onRetryGeminiApi,
+                    enabled = !isAnalyzing,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("Gemini API로 재시도")
+                    Text(if (isAnalyzing) "분석 진행 중..." else "Gemini API로 재시도")
                 }
                 OutlinedButton(
                     onClick = onRetryOnDevice,
+                    enabled = !isAnalyzing,
                     modifier = Modifier.weight(1f)
                 ) {
                     Text("온디바이스로 재분석")
