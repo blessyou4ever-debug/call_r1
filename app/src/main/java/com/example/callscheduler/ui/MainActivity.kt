@@ -149,11 +149,25 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // 앱 실행 시 혹시 이전에 멈춰 있던 '⏳ 분석 진행 중...' 레코드가 있다면 1초 내에 자동 정상 복구!
+                LaunchedEffect(Unit) {
+                    scope.launch {
+                        val cleaned = dao.cleanupStaleAnalyzingRecords()
+                        if (cleaned > 0) {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "이전에 멈춰 있던 분석 기록 ${cleaned}건을 정상 복구했습니다.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+
                 Scaffold(
                     topBar = {
                         Surface(tonalElevation = 3.dp, modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(16.dp)) {
-                                Text("통화 녹음 자동 일정·할 일 관리 (v3.4)", style = MaterialTheme.typography.titleLarge)
+                                Text("통화 녹음 자동 일정·할 일 관리 (v3.5)", style = MaterialTheme.typography.titleLarge)
                                 Text(
                                     "과거 통화 녹음 자동 불러오기 완벽 차단 + 통화 종료 직후 새 녹음만 실시간 감지",
                                     style = MaterialTheme.typography.bodySmall
@@ -798,17 +812,15 @@ fun CallRecordLogCard(
             ) {
                 Button(
                     onClick = onRetryGeminiApi,
-                    enabled = !isAnalyzing,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text(if (isAnalyzing) "분석 진행 중..." else "Gemini API로 재시도")
+                    Text(if (isAnalyzing) "⚡ 강제 취소 후 Gemini 재시도" else "Gemini API로 재시도")
                 }
                 OutlinedButton(
                     onClick = onRetryOnDevice,
-                    enabled = !isAnalyzing,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("내장 엔진으로 재분석")
+                    Text(if (isAnalyzing) "내장 엔진 재시작" else "내장 엔진으로 재분석")
                 }
             }
         }

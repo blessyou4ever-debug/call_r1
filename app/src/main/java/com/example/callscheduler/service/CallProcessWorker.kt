@@ -111,6 +111,7 @@ object CallAnalysisRunner {
             // 동시 다발적인 오디오 디코딩/네트워크 충돌 방지를 위해 순차 락 안에서 본 분석 수행
             return runnerMutex.withLock {
                 val settings = AiSettingsDataStore(appContext)
+                val timedOutcome = kotlinx.coroutines.withTimeoutOrNull(35_000L) {
                 val onDeviceExtractor = OnDeviceLiteRtExtractor(appContext)
                 val cloudEngine = CloudGeminiEngine(settings)
                 val processor = HybridCallAiProcessor(
@@ -257,7 +258,51 @@ object CallAnalysisRunner {
                 }
 
                 true
+                } // withTimeoutOrNull end
+
+                if (timedOutcome == null) {
+                    val timeoutTimeStr = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date())
+                    dao.upsertCallRecord(
+                        existingId = liveRecordId,
+                        record = CallRecordEntity(
+                            id = liveRecordId,
+                            filePath = metadata.filePath,
+                            contactName = metadata.contactName,
+                            phoneNumber = metadata.phoneNumber,
+                            callTimestampEpochMillis = callEpochMillis,
+                            transcript = "[분석 시간 초과 (35초, ${timeoutTimeStr})]\n단말기 음성 처리 시간이 초과되어 안전하게 중단했습니다. (더 이상 멈춰있지 않습니다)\n무료 Gemini API 키를 등록하면 3~5초 만에 정확한 전체 통화 분석이 완료됩니다.",
+                            engineUsed = "ERROR (시간 초과)"
+                        ),
+                        clearPendingActionsOnUpdate = false
+                    )
+                    false
+                } else {
+                    timedOutcome
+                }
             }
+        } catch (t: Throwable) {
+            val errStr = SimpleDateFormat("HH:mm:ss", Locale.KOREA).format(Date())
+            runCatching {
+                val db = AppDatabase.getInstance(appContext)
+                val liveId = db.dao().findRecordIdByFilePath(filePath)
+                if (liveId != null) {
+                    val meta = CallFilenameParser.parse(File(filePath))
+                    db.dao().upsertCallRecord(
+                        existingId = liveId,
+                        record = CallRecordEntity(
+                            id = liveId,
+                            filePath = filePath,
+                            contactName = meta.contactName,
+                            phoneNumber = meta.phoneNumber,
+                            callTimestampEpochMillis = meta.callDateTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli(),
+                            transcript = "[분석 중단 (${errStr})]\n${t.message ?: "작업 취소 또는 단말기 리소스 부족"}\n아래 [Gemini API로 재시도] 또는 [내장 엔진으로 재분석]을 눌러 다시 시도할 수 있습니다.",
+                            engineUsed = "ERROR (중단됨)"
+                        ),
+                        clearPendingActionsOnUpdate = false
+                    )
+                }
+            }
+            false
         } finally {
             activePaths.remove(filePath)
         }

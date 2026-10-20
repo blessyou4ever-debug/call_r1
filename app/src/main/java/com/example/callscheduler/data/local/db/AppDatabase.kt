@@ -52,6 +52,26 @@ class CallSchedulerDao(private val dbHelper: AppDatabase) {
         refreshFlowSync()
     }
 
+    /**
+     * 앱 비정상 종료, 프로세스 킬, 백그라운드 중단 등으로 인해 DB에 '⏳ 분석 진행 중...'
+     * 상태로 멈춰 있는 좀비 레코드를 감지하여 [분석 시간 초과 (중단됨)] 상태로 즉시 복구합니다.
+     */
+    suspend fun cleanupStaleAnalyzingRecords(): Int = withContext(Dispatchers.IO) {
+        val db = dbHelper.writableDatabase
+        val values = ContentValues().apply {
+            put("engineUsed", "ERROR (시간 초과)")
+            put(
+                "transcript",
+                "[분석 시간 초과 (중단됨)]\n이전 분석이 비정상 종료되었거나 응답 제한 시간(30초)을 초과하여 안전하게 복구했습니다.\n아래 [Gemini API로 재시도] 또는 [내장 엔진으로 재분석]을 눌러 다시 실행할 수 있습니다."
+            )
+        }
+        val affected = db.update("call_records", values, "engineUsed LIKE '⏳%'", null)
+        if (affected > 0) {
+            refreshFlowSync()
+        }
+        affected
+    }
+
     suspend fun hasProcessedFile(filePath: String): Boolean = withContext(Dispatchers.IO) {
         val db = dbHelper.readableDatabase
         db.rawQuery(

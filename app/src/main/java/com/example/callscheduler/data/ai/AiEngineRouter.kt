@@ -166,7 +166,7 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
         if (pcmBytes.isEmpty()) return Pair(null, -1)
 
         var lastErr = -1
-        val text = withTimeoutOrNull(5_500L) {
+        val text = withTimeoutOrNull(3_800L) {
             withContext(Dispatchers.Main) {
                 suspendCancellableCoroutine<String?> { cont ->
                     val recognizer = runCatching {

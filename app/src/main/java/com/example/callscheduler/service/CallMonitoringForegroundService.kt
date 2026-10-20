@@ -503,7 +503,7 @@ class CallMonitoringForegroundService : Service() {
 
         val notification = NotificationCompat.Builder(this, MONITOR_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_call)
-            .setContentTitle("새 통화 녹음만 실시간 감지 중 (v3.4)")
+            .setContentTitle("새 통화 녹음만 실시간 감지 중 (v3.5)")
             .setContentText(folderSummary)
             .setOngoing(true)
             .build()

@@ -63,18 +63,25 @@ object AudioPcmDecoder {
             var isEOS = false
             rawOut = ByteArrayOutputStream((inputAudioFile.length().toInt() * 3).coerceIn(65536, 8 * 1024 * 1024))
 
-            while (!isEOS) {
-                val inIndex = createdCodec.dequeueInputBuffer(8_000)
-                if (inIndex >= 0) {
-                    val inputBuffer = createdCodec.getInputBuffer(inIndex)
-                    if (inputBuffer != null) {
-                        val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                        if (sampleSize < 0) {
-                            createdCodec.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            isEOS = true
-                        } else {
-                            createdCodec.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
-                            extractor.advance()
+            var isInputEOS = false
+            var isOutputEOS = false
+            var loopSafetyCounter = 0
+            val maxLoops = 25_000 // 최대 약 25,000 프레임(충분히 긴 통화 디코딩 보장 및 무한루프 방지)
+
+            while (!isOutputEOS && loopSafetyCounter++ < maxLoops) {
+                if (!isInputEOS) {
+                    val inIndex = createdCodec.dequeueInputBuffer(8_000)
+                    if (inIndex >= 0) {
+                        val inputBuffer = createdCodec.getInputBuffer(inIndex)
+                        if (inputBuffer != null) {
+                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                            val advanced = if (sampleSize > 0) extractor.advance() else false
+                            if (sampleSize <= 0 || !advanced) {
+                                createdCodec.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                isInputEOS = true
+                            } else {
+                                createdCodec.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
+                            }
                         }
                     }
                 }
@@ -90,7 +97,7 @@ object AudioPcmDecoder {
                     }
                     createdCodec.releaseOutputBuffer(outIndex, false)
                     if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                        isEOS = true
+                        isOutputEOS = true
                         break
                     }
                     outIndex = createdCodec.dequeueOutputBuffer(bufferInfo, 0)
