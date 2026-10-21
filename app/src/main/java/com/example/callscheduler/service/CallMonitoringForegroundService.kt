@@ -8,12 +8,14 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.database.ContentObserver
 import android.media.AudioManager
+import android.media.AudioRecordingConfiguration
 import android.net.Uri
 import android.os.Build
 import android.os.FileObserver
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
@@ -40,9 +42,9 @@ class CallMonitoringForegroundService : Service() {
         private const val KEY_WATERMARK_MILLIS = "watermark_epoch_millis"
         private const val KEY_SEEN_PATHS = "seen_file_paths"
 
-        // 장시간 통화(최대 20분)에서도 DATE_ADDED 기준 누락이 발생하지 않도록 20분 창을 허용하되,
-        // 감시 시작 시각(Watermark) 이전에 생성/수정된 과거 녹음은 100% 원천 차단합니다.
-        private const val MAX_AUTO_DETECT_AGE_MILLIS = 90 * 1000L // 녹음 완료 직후(lastModified 기준 90초 이내) 파일만 감지하여 평상시 오작동 원천 차단
+        // 장시간 통화(최대 30분) 후에도 파일 생성 시각(DATE_ADDED)이나 수정 시각 기준으로 누락되지 않도록 30분 허용
+        // (감시 시작 기준선 Watermark 이전의 과거 파일은 100% 차단됨)
+        private const val MAX_AUTO_DETECT_AGE_MILLIS = 30 * 60 * 1000L
         private const val MAX_SEEN_CACHE_SIZE = 500
 
         const val ACTION_RESET_BASELINE = "com.example.callscheduler.ACTION_RESET_BASELINE"
@@ -55,11 +57,10 @@ class CallMonitoringForegroundService : Service() {
         @Volatile
         private var cachedWatermarkMillis: Long = 0L
 
-        // 백그라운드 전용 스캔 스레드 풀 (메인 스레드 블로킹 및 상시 폴링으로 인한 배터리 소모 완벽 제거)
         private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         private val isScanRunning = AtomicBoolean(false)
         @Volatile
-        private var debouncedScanJob: Job? = null
+        private var multiStageScanJob: Job? = null
 
         fun getMonitoredDirectories(context: Context): List<String> {
             return AiSettingsDataStore(context.applicationContext).getActiveMonitoredDirs()
@@ -80,9 +81,18 @@ class CallMonitoringForegroundService : Service() {
         }
 
         /**
-         * 최초 설치/권한 승인 또는 사용자가 명시적으로 기준선 리셋(폴더 변경·목록 비우기)을 요청했을 때만
-         * 현재 존재하는 모든 기존 녹음 파일(폴더 + MediaStore + SAF)을 seen에 등록하고 기준 시각(Watermark)을 설정합니다.
+         * 현재 전화 통화가 진행 중인지 확인합니다 (권한 불필요).
+         * 통화 진행 중에는 녹음 파일이 생성되더라도 아직 녹음이 끝나지 않았으므로,
+         * 섣불리 seen 처리하거나 불완전한 파일을 분석하지 않고 통화 종료 시점까지 대기합니다.
          */
+        private fun isPhoneCallCurrentlyActive(context: Context): Boolean {
+            val am = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
+            val mode = am.mode
+            return mode == AudioManager.MODE_IN_CALL ||
+                mode == AudioManager.MODE_IN_COMMUNICATION ||
+                mode == AudioManager.MODE_RINGTONE
+        }
+
         fun initializeOrResetBaseline(context: Context, forceResetToNow: Boolean = false) {
             val appCtx = context.applicationContext
             val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -99,7 +109,6 @@ class CallMonitoringForegroundService : Service() {
             ioScope.launch {
                 val seen = existingSeen.toMutableSet()
 
-                // 1) 감시 대상 폴더의 기존 파일들을 모두 seen에 등록
                 for (dirPath in getMonitoredDirectories(appCtx)) {
                     val dir = File(dirPath)
                     if (dir.exists() && dir.isDirectory) {
@@ -112,7 +121,6 @@ class CallMonitoringForegroundService : Service() {
                     }
                 }
 
-                // 2) MediaStore 상의 기존 통화 녹음 파일들도 모두 seen에 등록
                 runCatching {
                     val projection = arrayOf(
                         MediaStore.Audio.Media.DATA,
@@ -144,7 +152,6 @@ class CallMonitoringForegroundService : Service() {
                     }
                 }
 
-                // 3) SAF Tree URI에 기존에 있던 파일들도 모두 seen 등록
                 scanSafTreeUriFiles(appCtx, onlyRegisterBaseline = true, seenSet = seen)
 
                 val boundedSeen = trimSeenSetIfNeeded(seen)
@@ -167,13 +174,19 @@ class CallMonitoringForegroundService : Service() {
             if (file.extension.lowercase() !in SUPPORTED_AUDIO_EXTS) return false
 
             val appCtx = context.applicationContext
+            // 통화가 아직 진행 중이면 녹음 파일이 계속 쓰이는 중이므로 pending에 등록만 하고 통화 종료 후 분석!
+            if (isPhoneCallCurrentlyActive(appCtx)) {
+                pendingFileSizes[file.absolutePath] = Pair(currentLength, System.currentTimeMillis())
+                return false
+            }
+
             ensureCacheLoaded(appCtx)
             val path = file.absolutePath
             val now = System.currentTimeMillis()
             val lastMod = file.lastModified()
             val watermark = if (cachedWatermarkMillis > 0L) cachedWatermarkMillis else now
 
-            // 감시 시작 시각(watermark) 이전에 만들어진 파일이거나 오래된 과거 파일은 자동 분석 제외
+            // 감시 시작 시각(watermark) 이전에 만들어진 과거 파일은 자동 분석 제외
             if (lastMod < watermark || (now - lastMod) > MAX_AUTO_DETECT_AGE_MILLIS) {
                 if (path !in inMemorySeenPaths) {
                     markFileAsSeen(appCtx, file, advanceWatermark = false)
@@ -183,7 +196,7 @@ class CallMonitoringForegroundService : Service() {
 
             val prevAnalyzedSize = analyzedFileSizes[path] ?: 0L
             if (path in inMemorySeenPaths) {
-                if (prevAnalyzedSize <= 0L || currentLength <= prevAnalyzedSize + 4096L) {
+                if (prevAnalyzedSize <= 0L || currentLength <= prevAnalyzedSize + 2048L) {
                     return false
                 }
             }
@@ -192,14 +205,14 @@ class CallMonitoringForegroundService : Service() {
             val ageSinceModified = now - lastMod
 
             if (prevPending == null) {
-                if (ageSinceModified >= 1500L) {
+                if (ageSinceModified >= 900L) {
                     return true
                 }
                 pendingFileSizes[path] = Pair(currentLength, now)
                 return false
             } else {
                 val (lastSize, firstSeenTime) = prevPending
-                if (currentLength == lastSize || (now - firstSeenTime) >= 3500L || ageSinceModified >= 1500L) {
+                if (currentLength == lastSize || (now - firstSeenTime) >= 2500L || ageSinceModified >= 900L) {
                     pendingFileSizes.remove(path)
                     return true
                 } else {
@@ -222,7 +235,6 @@ class CallMonitoringForegroundService : Service() {
             val watermarkUpdated = newWatermark != cachedWatermarkMillis
             cachedWatermarkMillis = newWatermark
 
-            // 실제로 새로운 파일 경로가 추가되었거나 Watermark가 갱신되었을 때만 SharedPreferences에 기록 (디스크 I/O 절감)
             if (added || watermarkUpdated) {
                 val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 val boundedSeen = trimSeenSetIfNeeded(inMemorySeenPaths.toMutableSet())
@@ -259,14 +271,22 @@ class CallMonitoringForegroundService : Service() {
             return null
         }
 
-        fun scanMonitoredDirectoriesForNewFiles(context: Context) {
+        /**
+         * 새 녹음 파일을 발견하여 분석 큐에 넣었으면 true를 반환합니다.
+         */
+        fun scanMonitoredDirectoriesForNewFiles(context: Context): Boolean {
             val appCtx = context.applicationContext
             ensureCacheLoaded(appCtx)
             if (cachedWatermarkMillis == 0L) {
                 initializeOrResetBaseline(appCtx, forceResetToNow = true)
-                return
+                return false
             }
 
+            if (isPhoneCallCurrentlyActive(appCtx)) {
+                return false
+            }
+
+            var foundNew = false
             val now = System.currentTimeMillis()
             val minModMillis = maxOf(cachedWatermarkMillis, now - MAX_AUTO_DETECT_AGE_MILLIS)
 
@@ -274,32 +294,36 @@ class CallMonitoringForegroundService : Service() {
                 val dir = File(dirPath)
                 if (!dir.exists() || !dir.isDirectory) continue
                 val files = dir.listFiles() ?: continue
-                // 전체 파일을 매번 정렬하지 않고 기준 시각(minModMillis) 이후에 수정된 새 오디오 파일만 필터링!
                 val recentCandidates = files.filter { f ->
                     f.isFile && f.lastModified() >= minModMillis && f.extension.lowercase() in SUPPORTED_AUDIO_EXTS
-                }
+                }.sortedByDescending { it.lastModified() }
 
-                for (file in recentCandidates) {
+                for (file in recentCandidates.take(5)) {
                     if (isReadyNewCallRecordingFile(appCtx, file)) {
                         markFileAsSeen(appCtx, file, advanceWatermark = true)
                         enqueueFileAnalysis(appCtx, file.absolutePath, forceReprocess = false)
+                        foundNew = true
                     }
                 }
             }
 
-            scanSafTreeUriFiles(appCtx, onlyRegisterBaseline = false, seenSet = null)
+            if (scanSafTreeUriFiles(appCtx, onlyRegisterBaseline = false, seenSet = null)) {
+                foundNew = true
+            }
+            return foundNew
         }
 
         private fun scanSafTreeUriFiles(
             context: Context,
             onlyRegisterBaseline: Boolean,
             seenSet: MutableSet<String>?
-        ) {
+        ): Boolean {
             val treeUriStr = AiSettingsDataStore(context).getCustomTreeUri()
-            if (treeUriStr.isBlank()) return
+            if (treeUriStr.isBlank()) return false
+            var triggeredAnalysis = false
             runCatching {
                 val treeUri = Uri.parse(treeUriStr)
-                val treeDocId = DocumentsContract.getTreeDocumentId(treeUri) ?: return
+                val treeDocId = DocumentsContract.getTreeDocumentId(treeUri) ?: return false
                 val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId)
                 val projection = arrayOf(
                     DocumentsContract.Document.COLUMN_DOCUMENT_ID,
@@ -329,20 +353,27 @@ class CallMonitoringForegroundService : Service() {
                             if (currentSeen.add(virtualKey)) {
                                 seenChanged = true
                             }
-                        } else if (virtualKey !in currentSeen && (now - lastMod) >= 1500L) {
-                            currentSeen.add(virtualKey)
-                            cachedWatermarkMillis = maxOf(watermark, lastMod)
-                            seenChanged = true
-                            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-                            val targetFile = File(context.cacheDir, name)
-                            context.contentResolver.openInputStream(docUri)?.use { input ->
-                                FileOutputStream(targetFile).use { output -> input.copyTo(output) }
-                            }
-                            if (lastMod > 0L) {
-                                runCatching { targetFile.setLastModified(lastMod) }
-                            }
-                            if (targetFile.exists() && targetFile.length() > 512L) {
-                                enqueueFileAnalysis(context, targetFile.absolutePath, forceReprocess = true)
+                        } else if (virtualKey !in currentSeen) {
+                            if ((now - lastMod) < 900L) {
+                                // 파일이 방금 생성되어 쓰기 중이면 pending에 넣어 다음 단계 스캔(2.5초 뒤)에서 확정
+                                pendingFileSizes[virtualKey] = Pair(size, now)
+                            } else {
+                                pendingFileSizes.remove(virtualKey)
+                                currentSeen.add(virtualKey)
+                                cachedWatermarkMillis = maxOf(watermark, lastMod)
+                                seenChanged = true
+                                val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                                val targetFile = File(context.cacheDir, name)
+                                context.contentResolver.openInputStream(docUri)?.use { input ->
+                                    FileOutputStream(targetFile).use { output -> input.copyTo(output) }
+                                }
+                                if (lastMod > 0L) {
+                                    runCatching { targetFile.setLastModified(lastMod) }
+                                }
+                                if (targetFile.exists() && targetFile.length() > 512L) {
+                                    enqueueFileAnalysis(context, targetFile.absolutePath, forceReprocess = true)
+                                    triggeredAnalysis = true
+                                }
                             }
                         }
                     }
@@ -356,6 +387,7 @@ class CallMonitoringForegroundService : Service() {
                         .apply()
                 }
             }
+            return triggeredAnalysis
         }
 
         private fun forceCopyLatestFromSafTree(context: Context): File? = runCatching {
@@ -402,43 +434,72 @@ class CallMonitoringForegroundService : Service() {
         }.getOrNull()
 
         /**
-         * 상시 폴링(3.5초 무한 루프)을 완전히 제거하고, 이벤트(FileObserver / ContentObserver / 통화 종료)가
-         * 발생했을 때만 백그라운드 IO 코루틴에서 디바운싱하여 스캔을 수행합니다.
+         * 통화 종료 또는 파일 이벤트 발생 시:
+         * 1) 화면이 꺼진 절전(Doze) 상태에서도 스캔 코루틴이 멈추지 않도록 최대 15초짜리 단기 WakeLock을 획득합니다.
+         * 2) 전화 앱(삼성 전화 / T전화)이 통화 종료 후 녹음 파일을 인코딩·저장·미디어스캔하는 지연 시간(1~12초)을 모두 커버하기 위해
+         *    [1.5초 -> 3.5초 -> 7.0초 -> 12.0초] 총 4단계 확인을 수행하되, 새 녹음을 찾는 즉시 조기 종료하고 WakeLock을 해제합니다.
          */
-        fun scheduleEventDrivenScan(context: Context, delayMillis: Long = 1200L) {
+        fun scheduleEventDrivenScan(
+            context: Context,
+            delayMillis: Long = 1200L,
+            isCallEndBurst: Boolean = false
+        ) {
             val appCtx = context.applicationContext
-            debouncedScanJob?.cancel()
-            debouncedScanJob = ioScope.launch {
-                if (delayMillis > 0L) delay(delayMillis)
-                runMediaStoreAndDirectoryScanOnIo(appCtx)
-                // 만약 방금 생성된 녹음 파일이 아직 쓰기 중(pendingFileSizes)이라면 최대 3회까지만 2초 간격으로 확인 후 즉시 종료
-                var retryCount = 0
-                while (pendingFileSizes.isNotEmpty() && retryCount < 3) {
-                    retryCount++
-                    delay(2000L)
-                    runMediaStoreAndDirectoryScanOnIo(appCtx)
+            multiStageScanJob?.cancel()
+            multiStageScanJob = ioScope.launch {
+                val pm = appCtx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+                val wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CallScheduler:PostCallScanWakeLock")?.apply {
+                    setReferenceCounted(false)
+                    runCatching { acquire(15_000L) }
+                }
+                try {
+                    val waitIntervals = if (isCallEndBurst) {
+                        // 통화 종료 직후에는 1.5초, +2.5초(4초), +3.5초(7.5초), +4.5초(12초)까지 최대 4회 다단계 스캔
+                        listOf(delayMillis.coerceAtLeast(1200L), 2500L, 3500L, 4500L)
+                    } else {
+                        // 일반 파일/MediaStore 이벤트 시 1.2초, +2.5초 총 2회 확인
+                        listOf(delayMillis.coerceAtLeast(400L), 2500L)
+                    }
+
+                    for (waitMs in waitIntervals) {
+                        delay(waitMs)
+                        // 아직 통화 중이라면 통화가 끝날 때까지 기다림
+                        if (isPhoneCallCurrentlyActive(appCtx)) continue
+                        val detected = runMediaStoreAndDirectoryScanOnIo(appCtx)
+                        if (detected && pendingFileSizes.isEmpty()) {
+                            break
+                        }
+                    }
+                } finally {
+                    runCatching {
+                        if (wakeLock?.isHeld == true) {
+                            wakeLock.release()
+                        }
+                    }
                 }
             }
         }
 
         fun enqueueRecentMediaStoreScan(context: Context) {
-            scheduleEventDrivenScan(context, delayMillis = 300L)
+            scheduleEventDrivenScan(context, delayMillis = 400L, isCallEndBurst = false)
         }
 
-        private fun runMediaStoreAndDirectoryScanOnIo(context: Context) {
-            if (!isScanRunning.compareAndSet(false, true)) return
+        private fun runMediaStoreAndDirectoryScanOnIo(context: Context): Boolean {
+            if (!isScanRunning.compareAndSet(false, true)) return false
             try {
                 val appCtx = context.applicationContext
                 ensureCacheLoaded(appCtx)
                 if (cachedWatermarkMillis == 0L) {
                     initializeOrResetBaseline(appCtx, forceResetToNow = true)
-                    return
+                    return false
                 }
 
-                scanMonitoredDirectoriesForNewFiles(appCtx)
+                if (isPhoneCallCurrentlyActive(appCtx)) return false
+
+                var foundAny = scanMonitoredDirectoriesForNewFiles(appCtx)
 
                 val minAllowedSeconds = maxOf(
-                    cachedWatermarkMillis / 1000L,
+                    (cachedWatermarkMillis / 1000L) - 5L,
                     (System.currentTimeMillis() - MAX_AUTO_DETECT_AGE_MILLIS) / 1000L
                 )
 
@@ -463,7 +524,7 @@ class CallMonitoringForegroundService : Service() {
                         val dataIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
                         val nameIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME)
                         var checked = 0
-                        while (cursor.moveToNext() && checked < 5) {
+                        while (cursor.moveToNext() && checked < 8) {
                             checked++
                             val path = if (dataIdx >= 0) cursor.getString(dataIdx) else null
                             val name = if (nameIdx >= 0) cursor.getString(nameIdx) else ""
@@ -472,12 +533,14 @@ class CallMonitoringForegroundService : Service() {
                                 if (isReadyNewCallRecordingFile(appCtx, file)) {
                                     markFileAsSeen(appCtx, file, advanceWatermark = true)
                                     enqueueFileAnalysis(appCtx, file.absolutePath, forceReprocess = false)
+                                    foundAny = true
                                     break
                                 }
                             }
                         }
                     }
                 }
+                return foundAny
             } finally {
                 isScanRunning.set(false)
             }
@@ -493,9 +556,10 @@ class CallMonitoringForegroundService : Service() {
             if (customDir.isNotEmpty() && lowerPath.startsWith(customDir)) return true
 
             val isCallFolderOrName = lowerPath.contains("/call/") ||
-                lowerPath.contains("/recordings/") ||
+                lowerPath.contains("/recordings/call") ||
                 lowerPath.contains("tphonecallrecords") ||
                 lowerPath.contains("tphone") ||
+                lowerPath.contains("call_rec") ||
                 lowerName.contains("통화") ||
                 lowerName.contains("call") ||
                 lowerName.contains("_010")
@@ -514,6 +578,7 @@ class CallMonitoringForegroundService : Service() {
     private val fileObservers = mutableListOf<FileObserver>()
     private var mediaStoreObserver: ContentObserver? = null
     private var audioModeListener: Any? = null
+    private var audioRecordingCallback: AudioManager.AudioRecordingCallback? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -521,7 +586,7 @@ class CallMonitoringForegroundService : Service() {
         startForegroundWithNotification()
         startWatchingCallDirectories()
         registerMediaStoreObserver()
-        registerCallEndAudioModeTrigger()
+        registerCallEndTriggers()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -532,7 +597,7 @@ class CallMonitoringForegroundService : Service() {
                 startForegroundWithNotification()
             }
             ACTION_FORCE_SCAN_LATEST -> {
-                scheduleEventDrivenScan(applicationContext, delayMillis = 300L)
+                scheduleEventDrivenScan(applicationContext, delayMillis = 300L, isCallEndBurst = true)
             }
         }
         return START_STICKY
@@ -549,9 +614,9 @@ class CallMonitoringForegroundService : Service() {
 
         val customDir = AiSettingsDataStore(this).getCustomCallDir()
         val folderSummary = if (customDir.isNotBlank()) {
-            "절전형 이벤트 감지 중 (대기 배터리 0%): $customDir"
+            "통화 종료 즉시 자동 감지 중 (대기 배터리 0%): $customDir"
         } else {
-            "절전형 이벤트 감지 중 (통화 종료 시에만 작동 · 대기 배터리 0%)"
+            "통화 종료 즉시 자동 감지 중 (대기 배터리 0%)"
         }
 
         val notification = NotificationCompat.Builder(this, MONITOR_CHANNEL_ID)
@@ -577,8 +642,7 @@ class CallMonitoringForegroundService : Service() {
         val observer = object : ContentObserver(handler) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 super.onChange(selfChange, uri)
-                // 미디어 스캐너의 연속 알림을 1.5초 디바운싱하여 백그라운드 IO 스레드에서 단 1회만 스캔
-                scheduleEventDrivenScan(applicationContext, delayMillis = 1500L)
+                scheduleEventDrivenScan(applicationContext, delayMillis = 1200L, isCallEndBurst = true)
             }
         }
         runCatching {
@@ -592,21 +656,43 @@ class CallMonitoringForegroundService : Service() {
     }
 
     /**
-     * 전화 상태 권한(READ_PHONE_STATE) 없이도 통화 종료 시점(MODE_IN_CALL -> MODE_NORMAL)을 감지하여
-     * SAF 전용 폴더 사용자까지 대기 중 폴링(0%) 없이 통화 직후에만 정확히 스캔합니다.
+     * 위험 권한(READ_PHONE_STATE) 없이 통화 종료 및 통화 녹음 완료 시점을 2중으로 정확히 포착합니다:
+     * 1) AudioRecordingCallback (API 24+): 삼성 전화·T전화의 통화 녹음 세션이 종료되는 정확한 순간 포착
+     * 2) OnModeChangedListener (API 31+): 통화 오디오 모드(MODE_IN_CALL)가 일반(MODE_NORMAL)로 복귀하는 순간 포착
      */
-    private fun registerCallEndAudioModeTrigger() {
+    private fun registerCallEndTriggers() {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+
+        // 1) 통화 녹음기(마이크/통화 스트림) 종료 감지 (모든 안드로이드 버전 동작, 대기 전력 0%)
+        runCatching {
+            var hadActiveRecording = false
+            val recCallback = object : AudioManager.AudioRecordingCallback() {
+                override fun onRecordingConfigChanged(configs: MutableList<AudioRecordingConfiguration>?) {
+                    super.onRecordingConfigChanged(configs)
+                    val currentlyRecording = !configs.isNullOrEmpty()
+                    if (currentlyRecording) {
+                        hadActiveRecording = true
+                    } else if (hadActiveRecording) {
+                        hadActiveRecording = false
+                        // 통화 녹음기가 파일 쓰기를 마치고 닫힌 직후이므로 다단계 스캔(1.5s, 4s, 7.5s, 12s) 즉시 가동!
+                        scheduleEventDrivenScan(applicationContext, delayMillis = 1500L, isCallEndBurst = true)
+                    }
+                }
+            }
+            audioManager.registerAudioRecordingCallback(recCallback, Handler(Looper.getMainLooper()))
+            audioRecordingCallback = recCallback
+        }
+
+        // 2) 통화 오디오 모드 종료 감지 (Android 12+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             runCatching {
-                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
                 var wasInCall = false
                 val listener = AudioManager.OnModeChangedListener { mode ->
-                    if (mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_IN_COMMUNICATION) {
+                    if (mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_IN_COMMUNICATION || mode == AudioManager.MODE_RINGTONE) {
                         wasInCall = true
                     } else if (wasInCall && mode == AudioManager.MODE_NORMAL) {
                         wasInCall = false
-                        // 통화가 끝난 직후 파일 저장 완료 시점에 맞춰 이벤트 스캔 예약
-                        scheduleEventDrivenScan(applicationContext, delayMillis = 2000L)
+                        scheduleEventDrivenScan(applicationContext, delayMillis = 1500L, isCallEndBurst = true)
                     }
                 }
                 audioManager.addOnModeChangedListener(ContextCompat.getMainExecutor(this), listener)
@@ -620,17 +706,16 @@ class CallMonitoringForegroundService : Service() {
         fileObservers.forEach { runCatching { it.stopWatching() } }
         fileObservers.clear()
 
-        val mask = FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO
+        val mask = FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO or FileObserver.CREATE
         for (dirPath in getMonitoredDirectories(applicationContext)) {
             val dir = File(dirPath)
             if (dir.exists() && dir.isDirectory) {
                 val obs = object : FileObserver(dir.absolutePath, mask) {
                     override fun onEvent(event: Int, path: String?) {
-                        val eventType = event and FileObserver.ALL_EVENTS
-                        if ((eventType == FileObserver.CLOSE_WRITE || eventType == FileObserver.MOVED_TO) && path != null) {
-                            val file = File(dir, path)
-                            if (file.extension.lowercase() in SUPPORTED_AUDIO_EXTS) {
-                                scheduleEventDrivenScan(applicationContext, delayMillis = 1200L)
+                        if (path != null) {
+                            val ext = path.substringAfterLast('.', "").lowercase()
+                            if (ext in SUPPORTED_AUDIO_EXTS) {
+                                scheduleEventDrivenScan(applicationContext, delayMillis = 1200L, isCallEndBurst = true)
                             }
                         }
                     }
@@ -642,13 +727,16 @@ class CallMonitoringForegroundService : Service() {
     }
 
     override fun onDestroy() {
-        debouncedScanJob?.cancel()
+        multiStageScanJob?.cancel()
         fileObservers.forEach { runCatching { it.stopWatching() } }
         fileObservers.clear()
         mediaStoreObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        audioRecordingCallback?.let { cb ->
+            runCatching { audioManager?.unregisterAudioRecordingCallback(cb) }
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             runCatching {
-                val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 val listener = audioModeListener as? AudioManager.OnModeChangedListener
                 if (audioManager != null && listener != null) {
                     audioManager.removeOnModeChangedListener(listener)

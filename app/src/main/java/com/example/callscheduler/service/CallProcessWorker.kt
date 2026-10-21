@@ -1,6 +1,7 @@
 package com.example.callscheduler.service
 
 import android.content.Context
+import android.os.PowerManager
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.example.callscheduler.data.ai.CloudGeminiEngine
@@ -76,6 +77,11 @@ object CallAnalysisRunner {
             return true
         }
 
+        val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val analysisWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CallScheduler:AnalysisWakeLock")?.apply {
+            setReferenceCounted(false)
+            runCatching { acquire(35_000L) }
+        }
         try {
             val targetFile = File(filePath)
             val db = AppDatabase.getInstance(appContext)
@@ -306,6 +312,11 @@ object CallAnalysisRunner {
             return false
         } finally {
             activePaths.remove(filePath)
+            runCatching {
+                if (analysisWakeLock?.isHeld == true) {
+                    analysisWakeLock.release()
+                }
+            }
         }
     }
 }

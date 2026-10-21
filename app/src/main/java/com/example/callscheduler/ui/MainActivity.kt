@@ -9,6 +9,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -208,6 +210,33 @@ class MainActivity : ComponentActivity() {
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
                                         Text("권한 허용 및 새 통화만 실시간 감시 시작 (과거 녹음 제외)")
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            runCatching {
+                                                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                                                if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                                                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                                        data = Uri.parse("package:$packageName")
+                                                    }
+                                                    startActivity(intent)
+                                                } else {
+                                                    Toast.makeText(
+                                                        this@MainActivity,
+                                                        "이미 배터리 '제한 없음(최적화 제외)' 상태입니다!",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                }
+                                            }.onFailure {
+                                                runCatching {
+                                                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("⚡ 배터리 '제한 없음' 1초 설정 (절전 모드 자동감지 누락 방지)")
                                     }
 
                                     FilledTonalButton(
@@ -647,6 +676,12 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 앱 화면을 열었을 때 방금 끝난 새 통화 녹음이 있다면 수동 버튼을 누르지 않아도 즉시 자동 감지
+        CallMonitoringForegroundService.scheduleEventDrivenScan(this, delayMillis = 300L, isCallEndBurst = false)
     }
 
     private fun autoStartMonitoringServiceIfPermitted() {
