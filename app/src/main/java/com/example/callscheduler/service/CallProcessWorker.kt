@@ -19,6 +19,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.text.SimpleDateFormat
 import java.time.LocalDateTime
@@ -111,7 +112,7 @@ object CallAnalysisRunner {
             // 동시 다발적인 오디오 디코딩/네트워크 충돌 방지를 위해 순차 락 안에서 본 분석 수행
             return runnerMutex.withLock {
                 val settings = AiSettingsDataStore(appContext)
-                val timedOutcome = kotlinx.coroutines.withTimeoutOrNull(35_000L) {
+                val timedOutcome = withTimeoutOrNull(35_000L) {
                 val onDeviceExtractor = OnDeviceLiteRtExtractor(appContext)
                 val cloudEngine = CloudGeminiEngine(settings)
                 val processor = HybridCallAiProcessor(
@@ -192,7 +193,7 @@ object CallAnalysisRunner {
                             ),
                             clearPendingActionsOnUpdate = false
                         )
-                        return@withLock false
+                        return@withTimeoutOrNull false
                     }
 
                     dao.upsertCallRecord(
@@ -208,7 +209,7 @@ object CallAnalysisRunner {
                         ),
                         clearPendingActionsOnUpdate = false
                     )
-                    return@withLock false
+                    return@withTimeoutOrNull false
                 }
 
                 val (transcript, engineUsed, extractedDtos) = processOutcome.getOrThrow()
@@ -302,7 +303,7 @@ object CallAnalysisRunner {
                     )
                 }
             }
-            false
+            return false
         } finally {
             activePaths.remove(filePath)
         }
