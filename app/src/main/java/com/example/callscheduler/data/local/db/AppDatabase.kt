@@ -75,7 +75,7 @@ class CallSchedulerDao(private val dbHelper: AppDatabase) {
     suspend fun hasProcessedFile(filePath: String): Boolean = withContext(Dispatchers.IO) {
         val db = dbHelper.readableDatabase
         db.rawQuery(
-            "SELECT id FROM call_records WHERE filePath = ? AND engineUsed NOT LIKE 'ERROR%' LIMIT 1",
+            "SELECT id FROM call_records WHERE filePath = ? LIMIT 1",
             arrayOf(filePath)
         ).use {
             it.moveToFirst()

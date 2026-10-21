@@ -42,7 +42,7 @@ class CallMonitoringForegroundService : Service() {
 
         // 장시간 통화(최대 20분)에서도 DATE_ADDED 기준 누락이 발생하지 않도록 20분 창을 허용하되,
         // 감시 시작 시각(Watermark) 이전에 생성/수정된 과거 녹음은 100% 원천 차단합니다.
-        private const val MAX_AUTO_DETECT_AGE_MILLIS = 20 * 60 * 1000L
+        private const val MAX_AUTO_DETECT_AGE_MILLIS = 90 * 1000L // 녹음 완료 직후(lastModified 기준 90초 이내) 파일만 감지하여 평상시 오작동 원천 차단
         private const val MAX_SEEN_CACHE_SIZE = 500
 
         const val ACTION_RESET_BASELINE = "com.example.callscheduler.ACTION_RESET_BASELINE"

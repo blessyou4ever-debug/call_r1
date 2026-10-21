@@ -109,7 +109,6 @@ class AiSettingsDataStore(context: Context) {
             result.add(custom)
         }
         DEFAULT_CALL_DIR_PRESETS.forEach { result.add(it.path) }
-        result.add("/storage/emulated/0/Recordings")
         result.add("/storage/emulated/0/MIUI/sound_recorder/call_rec")
         return result.toList()
     }

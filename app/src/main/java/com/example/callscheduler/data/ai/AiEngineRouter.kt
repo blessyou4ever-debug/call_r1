@@ -69,42 +69,22 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
                     chunkFiles.addAll(AudioPcmDecoder.splitAndTrimSilenceIntoChunks(decoded, context.cacheDir, chunkSeconds = 10))
 
                     val segments = mutableListOf<String>()
-                    // 기본 내장 음성 인식기(오프라인 언어팩 불필요, 무료)를 1순위로 사용하고, 안 될 경우 OnDevice 전용 인식기로 즉시 교차 시도
-                    var preferStandardRecognizer = true
                     var lastRecognizerErrorCode = -1
 
-                    for ((index, chunk) in chunkFiles.take(6).withIndex()) {
-                        val firstTry = recognizeSinglePcmChunkViaPipe(
-                            pcmFile = chunk,
-                            useStandardRecognizer = preferStandardRecognizer
-                        )
-                        val chunkText = if (!firstTry.first.isNullOrBlank()) {
-                            firstTry.first
-                        } else if (index == 0) {
-                            // 첫 번째 청크가 실패하면 즉시 반대쪽 엔진(표준 <-> 온디바이스 전용)으로 교차 재시도!
-                            val secondTry = recognizeSinglePcmChunkViaPipe(
-                                pcmFile = chunk,
-                                useStandardRecognizer = !preferStandardRecognizer
-                            )
-                            if (!secondTry.first.isNullOrBlank()) {
-                                preferStandardRecognizer = !preferStandardRecognizer
-                                secondTry.first
-                            } else {
-                                lastRecognizerErrorCode = secondTry.second.takeIf { it != -1 } ?: firstTry.second
-                                null
-                            }
-                        } else {
-                            lastRecognizerErrorCode = firstTry.second
-                            null
-                        }
-
+                    // Android 시스템 인텔리전스(createOnDeviceSpeechRecognizer)는 백그라운드에서 과도한 CPU/발열을 유발하므로 호출하지 않으며,
+                    // 단일 표준 인식기만 사용하고 첫 청크 실패 시 즉시 종료(Fail-Fast)하여 백그라운드 리소스 점유를 원천 차단합니다.
+                    for ((index, chunk) in chunkFiles.take(4).withIndex()) {
+                        val attempt = recognizeSinglePcmChunkViaPipe(pcmFile = chunk)
+                        val chunkText = attempt.first
                         if (!chunkText.isNullOrBlank()) {
                             segments.add(chunkText.trim())
-                        } else if (index == 0 && segments.isEmpty()) {
-                            // 첫 번째 청크가 양쪽 인식기에서 모두 실패하면 15개 청크를 2분 30초 동안 기다리지 않고 3초 만에 즉시 종료(Fail-Fast)!
-                            break
+                        } else {
+                            lastRecognizerErrorCode = attempt.second
+                            if (index == 0 && segments.isEmpty()) {
+                                break
+                            }
                         }
-                        delay(80L)
+                        delay(60L)
                     }
 
                     val fullTranscript = segments.joinToString(" ").trim()
@@ -125,7 +105,7 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
                     val errorReason = describeSpeechErrorCode(lastRecognizerErrorCode)
                     return@withContext Result.failure(
                         IllegalStateException(
-                            "단말기 내장 음성 인식 실패 (${errorReason}). 휴대폰 [설정 → 애플리케이션 → 기본 앱 → 디지털 어시스턴트 앱 / 음성 입력]에서 Google 음성 인식이 켜져 있는지 확인하거나 [Gemini API로 재시도]를 눌러 주세요."
+                            "단말기 내장 음성 인식 실패 (${errorReason}). 백그라운드 발열 방지를 위해 즉시 중단했습니다. 무료 Gemini API 키를 등록하시면 발열·배터리 소모 없이 3초 만에 정확히 분석됩니다."
                         )
                     )
                 } finally {
@@ -145,149 +125,168 @@ class OnDeviceWhisperSttEngine(private val context: Context) : SttEngine {
     private fun describeSpeechErrorCode(code: Int): String = when (code) {
         SpeechRecognizer.ERROR_NO_MATCH -> "음성 매칭 결과 없음(ERROR_NO_MATCH)"
         SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "음성 입력 시간 초과(ERROR_SPEECH_TIMEOUT)"
-        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED, 12 -> "한국어 오프라인 음성팩 미설치(ERROR_LANGUAGE_UNAVAILABLE)"
+        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED, 12 -> "한국어 음성팩 미지원(ERROR_LANGUAGE_UNAVAILABLE)"
         SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "마이크 권한 필요(ERROR_INSUFFICIENT_PERMISSIONS)"
         SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "음성 인식기 사용 중(ERROR_RECOGNIZER_BUSY)"
         SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "네트워크 연결 지연"
-        -1 -> "인식기 응답 시간 초과(5초)"
+        -1 -> "인식기 응답 시간 초과(2.8초)"
         else -> "오류 코드 $code"
     }
 
     /**
-     * 정적 파일 디스크립터 대신 ParcelFileDescriptor.createPipe()로 16kHz Mono PCM 스트림을 주입하고
-     * 쓰기 완료 즉시 파이프를 닫아(EOF) SpeechRecognizer가 12초를 기다리지 않고 1~2초 만에 결과를 반환하게 만듭니다.
+     * 핵심 배터리·발열 수정:
+     * SpeechRecognizer.stopListening() / cancel() / destroy()는 반드시 메인 스레드(Main Looper)에서 호출되어야 합니다.
+     * 기존에는 withTimeoutOrNull 취소 콜백(DefaultExecutor 스레드)에서 destroy()를 호출해 CalledFromWrongThread 예외로
+     * 음성 인식 서비스(Google 음성 인식 및 합성 / Android 시스템 인텔리전스)가 종료되지 않고 백그라운드에서 계속 도는 누수가 발생했습니다.
+     * 이제 withContext(Dispatchers.Main)의 try/finally 블록과 Main Looper 핸들러를 통해 100% 메인 스레드에서 즉시 강제 종료합니다.
      */
     private suspend fun recognizeSinglePcmChunkViaPipe(
-        pcmFile: File,
-        useStandardRecognizer: Boolean
+        pcmFile: File
     ): Pair<String?, Int> {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return Pair(null, -1)
         val pcmBytes = runCatching { pcmFile.readBytes() }.getOrNull() ?: return Pair(null, -1)
         if (pcmBytes.isEmpty()) return Pair(null, -1)
 
         var lastErr = -1
-        val text = withTimeoutOrNull(3_800L) {
-            withContext(Dispatchers.Main) {
-                suspendCancellableCoroutine<String?> { cont ->
-                    val recognizer = runCatching {
-                        if (useStandardRecognizer) {
-                            SpeechRecognizer.createSpeechRecognizer(context)
-                        } else if (SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
-                            SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
-                        } else {
-                            SpeechRecognizer.createSpeechRecognizer(context)
-                        }
-                    }.getOrNull()
+        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
-                    if (recognizer == null) {
-                        if (cont.isActive) cont.resume(null)
-                        return@suspendCancellableCoroutine
+        val text = withContext(Dispatchers.Main) {
+            var recognizer: SpeechRecognizer? = null
+            var readSide: ParcelFileDescriptor? = null
+            var writeSide: ParcelFileDescriptor? = null
+            var writerJob: kotlinx.coroutines.Job? = null
+            val cleanedUp = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            fun cleanupRecognizerOnMainThread() {
+                if (!cleanedUp.compareAndSet(false, true)) return
+                writerJob?.cancel()
+                runCatching { readSide?.close() }
+                runCatching { writeSide?.close() }
+                val targetRecognizer = recognizer
+                recognizer = null
+                if (targetRecognizer != null) {
+                    val releaseRunnable = Runnable {
+                        runCatching { targetRecognizer.setRecognitionListener(null) }
+                        runCatching { targetRecognizer.stopListening() }
+                        runCatching { targetRecognizer.cancel() }
+                        runCatching { targetRecognizer.destroy() }
                     }
-
-                    val pipe = runCatching { ParcelFileDescriptor.createPipe() }.getOrNull()
-                    if (pipe == null) {
-                        runCatching { recognizer.destroy() }
-                        if (cont.isActive) cont.resume(null)
-                        return@suspendCancellableCoroutine
-                    }
-                    val readSide = pipe[0]
-                    val writeSide = pipe[1]
-
-                    // 백그라운드에서 PCM 데이터를 실시간 스트리밍 후 즉시 EOF(close) 전송
-                    val writerJob = CoroutineScope(Dispatchers.IO).launch {
-                        runCatching {
-                            ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { os ->
-                                val frameChunk = 6400 // 200ms at 16kHz 16-bit mono
-                                var offset = 0
-                                while (offset < pcmBytes.size) {
-                                    val len = (pcmBytes.size - offset).coerceAtMost(frameChunk)
-                                    os.write(pcmBytes, offset, len)
-                                    os.flush()
-                                    offset += len
-                                    delay(15L)
-                                }
-                            }
-                        }
-                    }
-
-                    val collectedPieces = mutableListOf<String>()
-                    var latestPartial = ""
-
-                    recognizer.setRecognitionListener(object : RecognitionListener {
-                        override fun onReadyForSpeech(params: Bundle?) {}
-                        override fun onBeginningOfSpeech() {}
-                        override fun onRmsChanged(rmsdB: Float) {}
-                        override fun onBufferReceived(buffer: ByteArray?) {}
-                        override fun onEndOfSpeech() {}
-
-                        override fun onPartialResults(partialResults: Bundle?) {
-                            val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            val part = list?.firstOrNull()?.trim()
-                            if (!part.isNullOrBlank()) {
-                                if (latestPartial.length >= 6 && part.length < latestPartial.length / 2) {
-                                    collectedPieces.add(latestPartial)
-                                }
-                                latestPartial = part
-                            }
-                        }
-
-                        override fun onResults(results: Bundle?) {
-                            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            val finalText = list?.firstOrNull()?.trim().takeUnless { it.isNullOrBlank() } ?: latestPartial
-                            if (finalText.isNotBlank()) {
-                                collectedPieces.add(finalText)
-                            }
-                            val combined = collectedPieces.distinct().joinToString(" ").trim()
-                            writerJob.cancel()
-                            runCatching { readSide.close() }
-                            runCatching { writeSide.close() }
-                            runCatching { recognizer.destroy() }
-                            if (cont.isActive) cont.resume(combined.ifBlank { null })
-                        }
-
-                        override fun onError(error: Int) {
-                            lastErr = error
-                            if (latestPartial.isNotBlank()) {
-                                collectedPieces.add(latestPartial)
-                            }
-                            val combined = collectedPieces.distinct().joinToString(" ").trim()
-                            writerJob.cancel()
-                            runCatching { readSide.close() }
-                            runCatching { writeSide.close() }
-                            runCatching { recognizer.destroy() }
-                            if (cont.isActive) cont.resume(combined.ifBlank { null })
-                        }
-
-                        override fun onEvent(eventType: Int, params: Bundle?) {}
-                    })
-
-                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
-                        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, readSide)
-                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
-                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
-                        putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16000)
-                    }
-
-                    cont.invokeOnCancellation {
-                        writerJob.cancel()
-                        runCatching { readSide.close() }
-                        runCatching { writeSide.close() }
-                        runCatching { recognizer.destroy() }
-                    }
-
-                    runCatching {
-                        recognizer.startListening(intent)
-                    }.onFailure {
-                        writerJob.cancel()
-                        runCatching { readSide.close() }
-                        runCatching { writeSide.close() }
-                        runCatching { recognizer.destroy() }
-                        if (cont.isActive) cont.resume(null)
+                    if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                        releaseRunnable.run()
+                    } else {
+                        mainHandler.postAtFrontOfQueue(releaseRunnable)
                     }
                 }
+            }
+
+            try {
+                withTimeoutOrNull(2_800L) {
+                    suspendCancellableCoroutine<String?> { cont ->
+                        val created = runCatching {
+                            SpeechRecognizer.createSpeechRecognizer(context.applicationContext)
+                        }.getOrNull()
+
+                        if (created == null) {
+                            if (cont.isActive) cont.resume(null)
+                            return@suspendCancellableCoroutine
+                        }
+                        recognizer = created
+
+                        val pipe = runCatching { ParcelFileDescriptor.createPipe() }.getOrNull()
+                        if (pipe == null) {
+                            cleanupRecognizerOnMainThread()
+                            if (cont.isActive) cont.resume(null)
+                            return@suspendCancellableCoroutine
+                        }
+                        readSide = pipe[0]
+                        writeSide = pipe[1]
+
+                        writerJob = CoroutineScope(Dispatchers.IO).launch {
+                            runCatching {
+                                ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { os ->
+                                    val frameChunk = 6400
+                                    var offset = 0
+                                    while (offset < pcmBytes.size) {
+                                        val len = (pcmBytes.size - offset).coerceAtMost(frameChunk)
+                                        os.write(pcmBytes, offset, len)
+                                        os.flush()
+                                        offset += len
+                                        delay(15L)
+                                    }
+                                }
+                            }
+                        }
+
+                        val collectedPieces = mutableListOf<String>()
+                        var latestPartial = ""
+
+                        created.setRecognitionListener(object : RecognitionListener {
+                            override fun onReadyForSpeech(params: Bundle?) {}
+                            override fun onBeginningOfSpeech() {}
+                            override fun onRmsChanged(rmsdB: Float) {}
+                            override fun onBufferReceived(buffer: ByteArray?) {}
+                            override fun onEndOfSpeech() {}
+
+                            override fun onPartialResults(partialResults: Bundle?) {
+                                val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                val part = list?.firstOrNull()?.trim()
+                                if (!part.isNullOrBlank()) {
+                                    if (latestPartial.length >= 6 && part.length < latestPartial.length / 2) {
+                                        collectedPieces.add(latestPartial)
+                                    }
+                                    latestPartial = part
+                                }
+                            }
+
+                            override fun onResults(results: Bundle?) {
+                                val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                val finalText = list?.firstOrNull()?.trim().takeUnless { it.isNullOrBlank() } ?: latestPartial
+                                if (finalText.isNotBlank()) {
+                                    collectedPieces.add(finalText)
+                                }
+                                val combined = collectedPieces.distinct().joinToString(" ").trim()
+                                cleanupRecognizerOnMainThread()
+                                if (cont.isActive) cont.resume(combined.ifBlank { null })
+                            }
+
+                            override fun onError(error: Int) {
+                                lastErr = error
+                                if (latestPartial.isNotBlank()) {
+                                    collectedPieces.add(latestPartial)
+                                }
+                                val combined = collectedPieces.distinct().joinToString(" ").trim()
+                                cleanupRecognizerOnMainThread()
+                                if (cont.isActive) cont.resume(combined.ifBlank { null })
+                            }
+
+                            override fun onEvent(eventType: Int, params: Bundle?) {}
+                        })
+
+                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
+                            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, pipe[0])
+                            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
+                            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                            putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16000)
+                        }
+
+                        cont.invokeOnCancellation {
+                            cleanupRecognizerOnMainThread()
+                        }
+
+                        runCatching {
+                            created.startListening(intent)
+                        }.onFailure {
+                            cleanupRecognizerOnMainThread()
+                            if (cont.isActive) cont.resume(null)
+                        }
+                    }
+                }
+            } finally {
+                // 타임아웃(2.8초)이나 코루틴 취소 시에도 100% 메인 스레드에서 cancel() + destroy() 보장!
+                cleanupRecognizerOnMainThread()
             }
         }
         return Pair(text, lastErr)
